@@ -450,3 +450,15 @@ Tests obligatoires dans `tests/test_training.py`, à faire échouer avant l’im
 - [ ] Code commenté, guide pédagogique, recette reproductible, rapport d’écarts et validations humaines enregistrées.
 
 **Limites assumées :** faible volume de données, masque BC synthétique documenté, absence de promesse sur le niveau de jeu, pas de reprise exacte d’un entraînement interrompu, pas d’exposition publique. Aucun de ces points ne dispense de la preuve finale dans PokeCoach.
+
+---
+
+## Addendum (2026-11-02) — étapes 8–9 réorientées
+
+Plan détaillé d’implémentation : [`2026-11-02-pokecoach-chargement-modele-unique.md`](2026-11-02-pokecoach-chargement-modele-unique.md).
+
+**Changement de scénario d’acceptation :** un fichier profil `vgc_model.yaml` (`VGC_MODEL_PROFILE`) regroupe chemin checkpoint + architecture (ou `trainer_package_dir`). **Même modèle sur p1 et p2** — pas de duel obligatoire Tiny vs checkpoint historique à l’étape 9.
+
+**Livré côté PokeCoach :** `VgcModelProfile`, `policy_factory`, `battle_session` + `runtime` via env, recette [`docs/recettes/pokecoach-charger-modele.md`](../recettes/pokecoach-charger-modele.md), rapport [`docs/reviews/palier-1-etapes-8-9.md`](../reviews/palier-1-etapes-8-9.md).
+
+**Reste pour clôturer le palier :** combat complet réel (`POKECOACH_VGC_REAL=1`), traces persistées, redémarrage avec le même profil — voir checklist étape 9 ci-dessus (adaptée au profil unique).
