@@ -1,0 +1,18 @@
+experiment:
+  name: bc-tiny-smoke
+  seed: 42
+
+dataset:
+  id: mb-002
+
+model:
+  d_model: 128
+  num_layers: 2
+  num_heads: 4
+  embed_len: 32
+  choose_on_teampreview: true
+
+training:
+  batch_size: 32
+  num_epochs: 3
+  device: auto

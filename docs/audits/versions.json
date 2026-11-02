@@ -1,0 +1,8 @@
+{
+  "vgc_bench_commit": "d79f9532947ac114dce1dda2456a590afcd375b2",
+  "showdown_commit": "913da3602a3aa1db79f9fdc5d5222eaf8d39569d",
+  "imitation_commit": "56eb3b295da5d52b8f7277c6ba206913b19ab110",
+  "poke_env_commit": "379a04628e42b2a2c94790c0788204b652f7ae1b",
+  "reference_checkpoint_sha256": "57f5edcab415cf6ccc1b6231923c8b66d3b1b7249b6b2562b97531471e4ca60b",
+  "python": "3.13"
+}

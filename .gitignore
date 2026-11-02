@@ -1,0 +1,11 @@
+.devbox/
+pokecoach-trainer/.venv/
+pokecoach-trainer/vendor/
+pokecoach-trainer/storage/
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
