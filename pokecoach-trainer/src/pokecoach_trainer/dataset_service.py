@@ -25,7 +25,6 @@ from pokecoach_trainer.trajectory_dataset import (
     load_trajectory_pickle,
     trajectory_to_imitation,
 )
-from pokecoach_trainer.upstream import vgc_bench_workdir
 
 
 def _manifest_path(dataset_id: str) -> Path:
@@ -117,6 +116,64 @@ def _split_replay_ids(
     return train, val
 
 
+def _promote_staging(staging_root: Path, out_root: Path, manifest_path: Path) -> None:
+    """Remplace train/validation et le manifeste par une préparation réussie."""
+
+    for split in ("train", "validation"):
+        dest = out_root / split
+        src = staging_root / split
+        if dest.exists():
+            shutil.rmtree(dest)
+        if src.exists():
+            shutil.move(str(src), str(dest))
+    staged_manifest = staging_root / "manifest.json"
+    if staged_manifest.is_file():
+        shutil.move(str(staged_manifest), str(manifest_path))
+
+
+def _write_prepared_trajectories(
+    tagged: list,
+    train_ids: list[str],
+    val_ids: list[str],
+    train_dir: Path,
+    val_dir: Path,
+) -> tuple[list[Path], list[Path], list[str]]:
+    """Écrit les pickles et retourne chemins + erreurs masque BC."""
+
+    from pokecoach_trainer.trajectory_dataset import assert_actions_allowed
+
+    train_set = set(train_ids)
+    val_set = set(val_ids)
+    traj_files_train: list[Path] = []
+    traj_files_val: list[Path] = []
+    errors: list[str] = []
+    train_dir.mkdir(parents=True, exist_ok=True)
+    val_dir.mkdir(parents=True, exist_ok=True)
+    for item in tagged:
+        traj = trajectory_to_imitation(item.trajectory)
+        replay_id = item.replay_id
+        player_side = item.player_side
+        try:
+            assert_actions_allowed(traj, replay_id)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if replay_id in train_set:
+            split_dir = train_dir
+            bucket = traj_files_train
+        elif replay_id in val_set:
+            split_dir = val_dir
+            bucket = traj_files_val
+        else:
+            errors.append(f"replay_id hors split: {replay_id}")
+            continue
+        out = split_dir / f"{replay_id}_{player_side}.pkl"
+        with out.open("wb") as f:
+            pickle.dump(traj, f)
+        bucket.append(out)
+    return traj_files_train, traj_files_val, errors
+
+
 def prepare_dataset(dataset_id: str, config: PrepareConfig) -> DatasetManifest:
     """Convertit les logs, contrôle le masque BC et écrit train/validation."""
 
@@ -146,58 +203,44 @@ def prepare_dataset(dataset_id: str, config: PrepareConfig) -> DatasetManifest:
     train_ids, val_ids = _split_replay_ids(replay_ids, config.seed, config.validation_ratio)
 
     out_root = storage_path("datasets", dataset_id)
-    train_dir = out_root / "train"
-    val_dir = out_root / "validation"
+    staging_root = out_root / ".prepare_staging"
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
+    train_dir = staging_root / "train"
+    val_dir = staging_root / "validation"
     train_dir.mkdir(parents=True, exist_ok=True)
     val_dir.mkdir(parents=True, exist_ok=True)
-    if config.force:
-        for split_dir in (train_dir, val_dir):
-            for pkl in split_dir.glob("*.pkl"):
-                pkl.unlink()
-        from vgc_bench.logs2trajs import _init_worker_loop, process_logs
 
-        with ProcessPoolExecutor(
-            max_workers=1, initializer=_init_worker_loop
-        ) as executor:
-            trajs = process_logs(
-                subset,
-                executor,
-                config.min_rating,
-                config.only_winner,
-                config.strict,
-            )
+    from vgc_bench.logs2trajs import _init_worker_loop, process_logs_with_provenance
 
-    if not trajs:
+    with ProcessPoolExecutor(max_workers=1, initializer=_init_worker_loop) as executor:
+        tagged = process_logs_with_provenance(
+            subset,
+            executor,
+            config.min_rating,
+            config.only_winner,
+            config.strict,
+        )
+
+    if not tagged:
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
         raise ValueError(
             "aucune trajectoire produite ; relancer avec strict=true pour la première erreur"
         )
 
-    # Associer trajectoires aux replays de façon best-effort (ordre process_logs)
-    traj_files_train: list[Path] = []
-    traj_files_val: list[Path] = []
-    errors: list[str] = []
-    for i, traj in enumerate(trajs):
-        traj = trajectory_to_imitation(traj)
-        replay_guess = replay_ids[i % len(replay_ids)]
-        try:
-            from pokecoach_trainer.trajectory_dataset import assert_actions_allowed
-
-            assert_actions_allowed(traj, replay_guess)
-        except ValueError as exc:
-            errors.append(str(exc))
-            continue
-        split = "train" if replay_guess in train_ids else "validation"
-        target_dir = train_dir if split == "train" else val_dir
-        out = target_dir / f"{replay_guess}_{i:04d}.pkl"
-        with out.open("wb") as f:
-            pickle.dump(traj, f)
-        if split == "train":
-            traj_files_train.append(out)
-        else:
-            traj_files_val.append(out)
+    traj_files_train, traj_files_val, errors = _write_prepared_trajectories(
+        tagged, train_ids, val_ids, train_dir, val_dir
+    )
 
     if errors:
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
         raise ValueError("conversion bloquée par masque BC: " + "; ".join(errors[:3]))
+
+    assert {x.replay_id for x in tagged if x.replay_id in train_ids} <= set(train_ids)
+    assert {x.replay_id for x in tagged if x.replay_id in val_ids} <= set(val_ids)
+    assert set(train_ids).isdisjoint(set(val_ids))
 
     manifest = DatasetManifest(
         dataset_id=dataset_id,
@@ -216,7 +259,10 @@ def prepare_dataset(dataset_id: str, config: PrepareConfig) -> DatasetManifest:
         rejected=rejected,
         errors=errors,
     )
-    write_json_atomic(manifest_path, manifest.model_dump(mode="json"))
+    write_json_atomic(staging_root / "manifest.json", manifest.model_dump(mode="json"))
+    _promote_staging(staging_root, out_root, manifest_path)
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
     return manifest
 
 
