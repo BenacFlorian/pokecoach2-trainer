@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ModelConfig(BaseModel):
@@ -49,10 +50,42 @@ class ModelConfig(BaseModel):
 
 
 class TrainingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["bc"] = "bc"
     batch_size: int = 32
     num_epochs: int = 3
     device: str = "auto"
-    learning_rate: float | None = None
+    learning_rate: float = 1e-4
+    evaluation_battles_per_epoch: int = 0
+
+    @field_validator("method")
+    @classmethod
+    def _method_bc_only(cls, v: str) -> str:
+        if v != "bc":
+            raise ValueError("seule la méthode bc est implémentée")
+        return v
+
+    @field_validator("batch_size", "num_epochs", "evaluation_battles_per_epoch")
+    @classmethod
+    def _non_negative_int(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("valeur entière invalide")
+        return v
+
+    @field_validator("batch_size", "num_epochs")
+    @classmethod
+    def _at_least_one(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("batch_size et num_epochs doivent être >= 1")
+        return v
+
+    @field_validator("learning_rate")
+    @classmethod
+    def _learning_rate_finite(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("learning_rate doit être fini et > 0")
+        return v
 
 
 class PrepareConfig(BaseModel):
@@ -65,30 +98,413 @@ class PrepareConfig(BaseModel):
     force: bool = False
 
 
+class SplitRatios(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    train: float = 0.80
+    validation: float = 0.10
+    test: float = 0.10
+
+    @model_validator(mode="after")
+    def _sum_one(self) -> SplitRatios:
+        total = self.train + self.validation + self.test
+        if not math.isclose(total, 1.0, rel_tol=0, abs_tol=1e-6):
+            raise ValueError("les ratios de split doivent sommer à 1")
+        if min(self.train, self.validation, self.test) <= 0:
+            raise ValueError("chaque ratio de split doit être > 0")
+        return self
+
+
+class DatasetRecipe(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    variant: Literal["natural"] = "natural"
+    regulation: str = "M-C"
+    target_replays: int = 300
+    seed: int = 42
+    min_elo: int | None = 1100
+    max_elo: int | None = None
+    min_rating: int | None = None
+    unknown_elo: Literal["exclude_perspective"] = "exclude_perspective"
+    only_winners: bool = False
+    only_winner: bool | None = None
+    require_ots: bool = True
+    require_complete_teams: bool = True
+    include_bo1: bool = True
+    include_bo3: bool = True
+    include_forfeits: bool = True
+    min_completed_turns_forfeit: int = 3
+    exclude_inactivity_losses: bool = True
+    deduplicate: bool = True
+    max_replays_per_team: int | None = None
+    splits: SplitRatios = Field(default_factory=SplitRatios)
+
+    @field_validator("target_replays")
+    @classmethod
+    def _target_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("target_replays doit être >= 1")
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if data.get("max_replays_per_team") is not None:
+            raise ValueError("max_replays_per_team non nul refusé en V1")
+        merged = dict(data)
+        min_elo = merged.get("min_elo")
+        min_rating = merged.get("min_rating")
+        if min_rating is not None:
+            if min_elo is not None and min_rating != min_elo:
+                raise ValueError("min_rating et min_elo contradictoires")
+            merged["min_elo"] = min_rating
+        only_winners = merged.get("only_winners")
+        only_winner = merged.get("only_winner")
+        if only_winner is not None:
+            if only_winners is not None and only_winner != only_winners:
+                raise ValueError("only_winner et only_winners contradictoires")
+            merged["only_winners"] = only_winner
+        min_elo = merged.get("min_elo")
+        max_elo = merged.get("max_elo")
+        if min_elo is not None and max_elo is not None and min_elo > max_elo:
+            raise ValueError("min_elo doit être <= max_elo")
+        return merged
+
+
+class CollectionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    format_ids: list[str]
+    upload_after: datetime | None = None
+    upload_before: datetime | None = None
+    max_new_replays: int = 5000
+    max_requests: int = 10000
+    max_duration_s: int = 7200
+    request_interval_s: float = 1.0
+    timeout_s: float = 30.0
+    max_attempts: int = 5
+
+    @field_validator("format_ids")
+    @classmethod
+    def _formats_non_empty(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("format_ids ne peut pas être vide")
+        return v
+
+    @field_validator("request_interval_s")
+    @classmethod
+    def _interval_min(cls, v: float) -> float:
+        if v < 1.0:
+            raise ValueError("request_interval_s doit être >= 1")
+        return v
+
+    @field_validator("max_attempts")
+    @classmethod
+    def _attempts_range(cls, v: int) -> int:
+        if v < 1 or v > 5:
+            raise ValueError("max_attempts doit être entre 1 et 5")
+        return v
+
+    @model_validator(mode="after")
+    def _date_order(self) -> CollectionConfig:
+        if self.upload_after and self.upload_before:
+            if self.upload_after > self.upload_before:
+                raise ValueError("upload_after doit précéder upload_before")
+        return self
+
+
+class SnapshotRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    format_ids: list[str]
+    upload_after: datetime | None = None
+    upload_before: datetime | None = None
+    replay_version_selection: dict[str, str] | None = None
+
+
+class ArchiveSource(BaseModel):
+    """Provenance d'un objet archivé (hors contenu fournisseur)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provenance: str
+    fetched_at: datetime
+    collector_revision: str = "pokecoach-trainer/0.1.0"
+
+
+class ArchiveRef(BaseModel):
+    """Référence publique vers un objet brut publié."""
+
+    replay_id: str
+    content_sha256: str
+    log_sha256: str
+    format_id: str
+    uploadtime: int | None = None
+    object_relpath: str
+    conflict: bool = False
+
+
+class ArchiveSnapshot(BaseModel):
+    """Snapshot immuable d'une sélection de l'archive."""
+
+    schema_version: int = 1
+    snapshot_id: str
+    snapshot_sha256: str
+    metadata_version: int = 1
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    format_ids: list[str]
+    upload_after: datetime | None = None
+    upload_before: datetime | None = None
+    refs: list[ArchiveRef]
+    bo3_links_status: Literal["unknown", "partial", "confirmed"] = "unknown"
+    replay_metadata: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class SearchPage(BaseModel):
+    """Page de résultats de recherche Showdown."""
+
+    replay_ids: list[str]
+    next_cursor: dict[str, Any] | None = None
+    page_uploadtimes: list[int] = Field(default_factory=list)
+
+
+class CollectionCursor(BaseModel):
+    """Curseur persisté par format source Showdown."""
+
+    format_id: str
+    before: int
+    phase: Literal["historical", "newer"] = "historical"
+    newest_bound: int | None = None
+
+
+class CollectionResult(BaseModel):
+    """Résultat d'un job de collecte."""
+
+    new_replays: int = 0
+    skipped_existing: int = 0
+    failed_replays: int = 0
+    total_requests: int = 0
+    stop_reason: str
+    budget_limit: str | None = None
+    coverage_incomplete: bool = False
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    effective_config: CollectionConfig
+
+
+class InitializationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["finetune"] = "finetune"
+    base_model_id: str
+    architecture: Literal["inherit"] = "inherit"
+
+
+class BaseModelSource(BaseModel):
+    """Provenance exigée avant enregistrement d'un parent SB3."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_model_id: str
+    label: str
+    expected_sha256: str
+    audit_reference: str | None = None
+    notes: str | None = None
+
+
+class BaseModelManifest(BaseModel):
+    """Manifeste immuable d'un modèle de base enregistré localement."""
+
+    schema_version: int = 1
+    base_model_id: str
+    source: BaseModelSource
+    checkpoint_sha256: str
+    checkpoint_relpath: str = "model.zip"
+    architecture: ModelConfig
+    contract_fingerprint: str
+    param_count: int
+    policy_class: str
+    load_status: str = "verified"
+    registered_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class EvaluationResult(BaseModel):
+    """NLL moyenne sur des démonstrations (copie isolée de la policy)."""
+
+    nll: float
+    transitions: int
+
+
+class FilterStage(str, Enum):
+    game = "game"
+    perspective = "perspective"
+    selection = "selection"
+    conversion = "conversion"
+
+
+class FilterDecision(BaseModel):
+    """Décision d'admissibilité traçable (n'altère pas l'archive)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: bool
+    stage: FilterStage
+    reason_code: str
+    replay_id: str
+    player_side: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    sources: list[str] = Field(default_factory=list)
+
+
+class ReplayMetadata(BaseModel):
+    """Faits observés sur un replay archivé (valeurs inconnues explicites)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    replay_id: str
+    raw_sha256: str
+    log_sha256: str
+    format_id: str
+    parser_version: str = "replay_metadata/1"
+    p1_username: str | None = None
+    p2_username: str | None = None
+    p1_rating: int | None = None
+    p2_rating: int | None = None
+    average_rating: int | None = None
+    winner: str | None = None
+    termination: Literal[
+        "normal_win",
+        "forfeit",
+        "inactivity",
+        "tie",
+        "unknown",
+    ] = "unknown"
+    completed_turns: int | None = None
+    ots_p1: bool = False
+    ots_p2: bool = False
+    team_complete_p1: bool = False
+    team_complete_p2: bool = False
+    match_type: Literal["bo1", "bo3", "unknown"] = "unknown"
+    series_id: str | None = None
+    game_number: int | None = None
+    linked_replay_ids: list[str] = Field(default_factory=list)
+    series_link_source: str | None = None
+    series_link_status: Literal["confirmed", "unknown", "conflict"] = "unknown"
+
+
+class ConversionStatus(str, Enum):
+    converted = "converted"
+    rejected = "rejected"
+    error = "error"
+
+
+class ConversionResult(BaseModel):
+    """Résultat d'une conversion replay/perspective."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    replay_id: str
+    raw_sha256: str
+    player_side: Literal["p1", "p2"]
+    series_id: str | None = None
+    status: ConversionStatus
+    reason_code: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    trajectory: Any | None = None
+    converter_revision: str = "conversion/1"
+    encoding_contract: str | None = None
+
+
+class ReplayGroup(BaseModel):
+    """Groupe indivisible pour sélection et splits."""
+
+    group_id: str
+    replay_ids: list[str]
+    alias_ids: list[str] = Field(default_factory=list)
+    series_id: str | None = None
+
+
+class SplitAssignments(BaseModel):
+    """Affectation train/validation/test par groupes."""
+
+    algorithm: str = "group_greedy_v1"
+    split_id: str
+    train: list[str] = Field(default_factory=list)
+    validation: list[str] = Field(default_factory=list)
+    test: list[str] = Field(default_factory=list)
+    group_to_split: dict[str, Literal["train", "validation", "test"]] = Field(
+        default_factory=dict
+    )
+    replay_counts: dict[str, int] = Field(default_factory=dict)
+    trainable: bool = True
+    reason_code: str | None = None
+    series_leakage_guarantee: bool = True
+    ungrouped_bo3_count: int = 0
+
+
 class DatasetState(str, Enum):
     imported = "imported"
+    created = "created"
     preparing = "preparing"
     ready = "ready"
+    insufficient_data = "insufficient_data"
     failed = "failed"
+    interrupted = "interrupted"
 
 
 class DatasetManifest(BaseModel):
+    schema_version: int = 2
     dataset_id: str
     state: DatasetState
     source_relpath: str | None = None
     source_sha256: str | None = None
+    snapshot_id: str | None = None
+    snapshot_sha256: str | None = None
+    recipe: DatasetRecipe | None = None
+    recipe_sha256: str | None = None
+    parent_dataset_id: str | None = None
+    prepare_job_id: str | None = None
     format: str | None = None
     seed: int = 42
     validation_ratio: float = 0.10
     replay_ids_train: list[str] = Field(default_factory=list)
     replay_ids_val: list[str] = Field(default_factory=list)
+    replay_ids_test: list[str] = Field(default_factory=list)
     trajectories_train: int = 0
     trajectories_val: int = 0
+    trajectories_test: int = 0
     transitions_train: int = 0
     transitions_val: int = 0
+    transitions_test: int = 0
+    selected_replays: int = 0
+    target_replays: int | None = None
+    overshoot_replays: int = 0
+    split_id: str | None = None
+    series_leakage_guarantee: bool = True
+    ungrouped_bo3_count: int = 0
+    encoding_contract_fingerprint: str | None = None
     rejected: list[dict[str, Any]] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CreateDatasetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_id: str | None = None
+    snapshot_id: str
+    recipe: DatasetRecipe
+    parent_dataset_id: str | None = None
+
+
+class LegacyImportDatasetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_id: str | None = None
+    inbox_relpath: str
+    recipe: DatasetRecipe
+    parent_dataset_id: str | None = None
 
 
 class ExperimentConfig(BaseModel):
@@ -96,6 +512,7 @@ class ExperimentConfig(BaseModel):
     seed: int = 42
     dataset_id: str
     model: ModelConfig = Field(default_factory=ModelConfig)
+    initialization: InitializationConfig | None = None
     training: TrainingConfig = Field(default_factory=TrainingConfig)
 
 
@@ -109,6 +526,18 @@ class TrainingResult(BaseModel):
     weight_delta_norm: float
     train_losses: list[float]
     val_losses: list[float]
+    architecture: ModelConfig | None = None
+    parent_base_model_id: str | None = None
+    parent_checkpoint_sha256: str | None = None
+    dataset_id: str | None = None
+    dataset_manifest_sha256: str | None = None
+    split_id: str | None = None
+    effective_learning_rate: float | None = None
+    observed_optimizer_steps: list[int] = Field(default_factory=list)
+    observed_transitions_per_epoch: list[int] = Field(default_factory=list)
+    actor_delta_norm: float | None = None
+    test_nll: float | None = None
+    test_report_path: str | None = None
 
 
 class JobStatus(str, Enum):
@@ -119,10 +548,68 @@ class JobStatus(str, Enum):
     interrupted = "interrupted"
 
 
+class JobKind(str, Enum):
+    collection = "collection"
+    prepare = "prepare"
+    training = "training"
+
+
+class CollectionJobConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["collection"] = "collection"
+    config: CollectionConfig
+
+
+class SnapshotDatasetSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["snapshot"] = "snapshot"
+    snapshot_id: str
+
+
+class LegacyImportDatasetSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["legacy_import"] = "legacy_import"
+    inbox_relpath: str
+    recipe: DatasetRecipe
+
+
+DatasetSource = Annotated[
+    SnapshotDatasetSource | LegacyImportDatasetSource,
+    Field(discriminator="source"),
+]
+
+
+class DatasetJobConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["prepare"] = "prepare"
+    dataset_id: str
+    dataset_source: DatasetSource
+    recipe: DatasetRecipe | None = None
+
+
+class TrainingJobConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["training"] = "training"
+    experiment: ExperimentConfig
+
+
+JobConfig = Annotated[
+    CollectionJobConfig | DatasetJobConfig | TrainingJobConfig,
+    Field(discriminator="kind"),
+]
+
+
 class JobRecord(BaseModel):
+    schema_version: int = 2
     job_id: str
+    kind: JobKind = JobKind.training
     status: JobStatus
-    config: ExperimentConfig
+    config: ExperimentConfig | JobConfig
     created_at: datetime = Field(default_factory=datetime.utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -130,9 +617,26 @@ class JobRecord(BaseModel):
     run_dir: str | None = None
     worker_token: str | None = None
     pid: int | None = None
+    startup_identity: str | None = None
+    progress: dict[str, Any] | None = None
+    result_ref: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_job_record(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if "kind" not in data and "config" in data:
+            cfg = data["config"]
+            if isinstance(cfg, dict) and "name" in cfg and "dataset_id" in cfg:
+                data = dict(data)
+                data.setdefault("kind", JobKind.training.value)
+                data.setdefault("schema_version", 1)
+        return data
 
 
 class ModelManifest(BaseModel):
+    schema_version: int = 2
     model_id: str
     architecture: ModelConfig
     dataset_id: str
@@ -141,6 +645,9 @@ class ModelManifest(BaseModel):
     checkpoint_sha256: str
     trainer_version: str
     vgc_bench_commit: str
+    trainer_reload: str = "passed"
+    reserved_test: str = "pending"
+    pokecoach_compatibility: str = "not_tested"
     published_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -151,3 +658,11 @@ class ReloadReport(BaseModel):
     architecture: ModelConfig
     max_output_delta: float | None = None
     message: str = ""
+
+
+def adapt_legacy_manifest(data: dict[str, Any]) -> dict[str, Any]:
+    """Adaptateur explicite pour manifestes historiques sans schema_version."""
+
+    out = dict(data)
+    out.setdefault("schema_version", 1)
+    return out

@@ -52,7 +52,17 @@ def storage_path(*parts: str) -> Path:
 
 
 def ensure_storage_layout() -> None:
-    for name in ("inbox", "raw_logs", "datasets", "jobs", "models", "runs"):
+    for name in (
+        "inbox",
+        "archive",
+        "base_models",
+        "staging",
+        "raw_logs",
+        "datasets",
+        "jobs",
+        "models",
+        "runs",
+    ):
         storage_path(name).mkdir(parents=True, exist_ok=True)
 
 

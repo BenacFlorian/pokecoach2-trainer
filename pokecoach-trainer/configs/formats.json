@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "formats": {
+    "ma": {
+      "format_id": "ma",
+      "source_format_ids": [
+        "gen9championsvgc2026regma",
+        "gen9championsvgc2026regmabo3"
+      ],
+      "engine_format_id": "gen9championsvgc2026regma",
+      "regulation": "M-A",
+      "collection_supported": true,
+      "conversion_supported": true,
+      "contract_fingerprint": null,
+      "audit_refs": [
+        "docs/audits/mc-compatibilite.md"
+      ]
+    },
+    "mb": {
+      "format_id": "mb",
+      "source_format_ids": [
+        "gen9championsvgc2026regmb",
+        "gen9championsvgc2026regmbbo3"
+      ],
+      "engine_format_id": "gen9championsvgc2026regmb",
+      "regulation": "M-B",
+      "collection_supported": true,
+      "conversion_supported": true,
+      "contract_fingerprint": null,
+      "audit_refs": [
+        "docs/audits/mc-compatibilite.md"
+      ]
+    },
+    "mc": {
+      "format_id": "mc",
+      "source_format_ids": [
+        "gen9championsvgc2026regmc",
+        "gen9championsvgc2026regmcbo3"
+      ],
+      "engine_format_id": "gen9championsvgc2026regmc",
+      "regulation": "M-C",
+      "collection_supported": true,
+      "conversion_supported": true,
+      "contract_fingerprint": null,
+      "audit_refs": [
+        "docs/audits/mc-compatibilite.md",
+        "docs/specs/2026-11-03-collecte-datasets-finetuning-mc.md"
+      ]
+    }
+  }
+}

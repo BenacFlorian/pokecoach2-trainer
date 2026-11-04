@@ -1,6 +1,6 @@
 import pytest
 
-from pokecoach_trainer.jobs import acquire_training_lock, release_training_lock
+from pokecoach_trainer.jobs import acquire_training_lock, release_job_lock
 
 
 def test_lock_exclusive(tmp_path, monkeypatch):
@@ -9,8 +9,8 @@ def test_lock_exclusive(tmp_path, monkeypatch):
 
     clear_settings_cache()
     ensure_storage_layout()
-    acquire_training_lock("job-a")
+    fd_a = acquire_training_lock("job-a")
     with pytest.raises(RuntimeError):
         acquire_training_lock("job-b")
-    release_training_lock("job-a")
+    release_job_lock("job-a", fd_a)
     acquire_training_lock("job-c")

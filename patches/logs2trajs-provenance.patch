@@ -1,0 +1,122 @@
+--- a/vgc_bench/logs2trajs.py
++++ b/vgc_bench/logs2trajs.py
+@@ -296,32 +296,32 @@
+         return np.stack(embedded_states, axis=0)
+ 
+ 
+-def process_logs(
++@dataclass(frozen=True)
++class TaggedTrajectory:
++    """Trajectoire avec provenance replay (indépendante de l'ordre des workers)."""
++
++    replay_id: str
++    player_side: str
++    trajectory: Trajectory
++
++
++def process_logs_with_provenance(
+     log_jsons: dict[str, tuple[str, str]],
+     executor: ProcessPoolExecutor,
+     min_rating: int | None,
+     only_winner: bool,
+     strict: bool,
+-) -> list[Trajectory]:
++) -> list[TaggedTrajectory]:
+     """
+-    Process multiple battle logs in parallel to extract trajectories.
+-
+-    Args:
+-        log_jsons: Dictionary mapping battle tags to (timestamp, log) tuples.
+-        executor: Process pool for parallel processing.
+-        min_rating: Minimum player rating to include (None for no filter).
+-        only_winner: If True, only extract trajectories from the winner's perspective.
+-        strict: If True, raise exceptions on parsing errors; otherwise skip.
+-
+-    Returns:
+-        List of Trajectory objects extracted from the logs.
++    Comme `process_logs`, mais chaque trajectoire conserve replay_id et côté joueur.
+     """
++
+     def chunked(iterable, size):
+         it = iter(iterable)
+         while chunk := list(islice(it, size)):
+             yield chunk
+ 
+-    trajs: list[Trajectory] = []
++    tagged: list[TaggedTrajectory] = []
+     task_params = [
+         (tag, log, "p1", min_rating, only_winner) for tag, (_, log) in log_jsons.items()
+     ] + [
+@@ -330,14 +330,24 @@
+     num_empty = 0
+     num_errors = 0
+     for chunk in chunked(task_params, 10_000):
+-        futures = [executor.submit(process_log, *params) for params in chunk]
+-        for future in as_completed(futures):
++        future_to_meta = {
++            executor.submit(process_log, *params): (params[0], params[2])
++            for params in chunk
++        }
++        for future in as_completed(future_to_meta):
++            replay_id, player_side = future_to_meta[future]
+             try:
+                 traj = future.result()
+                 if traj is None:
+                     num_empty += 1
+                 else:
+-                    trajs.append(traj)
++                    tagged.append(
++                        TaggedTrajectory(
++                            replay_id=replay_id,
++                            player_side=player_side,
++                            trajectory=traj,
++                        )
++                    )
+             except KeyboardInterrupt:
+                 raise
+             except SystemExit:
+@@ -346,13 +356,41 @@
+                 if strict:
+                     raise e
+                 num_errors += 1
+-    num_trans = sum(len(t.acts) for t in trajs)
++    num_trans = sum(len(t.trajectory.acts) for t in tagged)
+     print(
+-        f"prepared {len(trajs)} trajectories with {num_trans} transitions "
++        f"prepared {len(tagged)} trajectories with {num_trans} transitions "
+         f"({num_empty} discarded trajs, {num_errors} failed traj reads)",
+         flush=True,
+     )
+-    return trajs
++    return tagged
++
++
++def process_logs(
++    log_jsons: dict[str, tuple[str, str]],
++    executor: ProcessPoolExecutor,
++    min_rating: int | None,
++    only_winner: bool,
++    strict: bool,
++) -> list[Trajectory]:
++    """
++    Process multiple battle logs in parallel to extract trajectories.
++
++    Args:
++        log_jsons: Dictionary mapping battle tags to (timestamp, log) tuples.
++        executor: Process pool for parallel processing.
++        min_rating: Minimum player rating to include (None for no filter).
++        only_winner: If True, only extract trajectories from the winner's perspective.
++        strict: If True, raise exceptions on parsing errors; otherwise skip.
++
++    Returns:
++        List of Trajectory objects extracted from the logs.
++    """
++    return [
++        item.trajectory
++        for item in process_logs_with_provenance(
++            log_jsons, executor, min_rating, only_winner, strict
++        )
++    ]
+ 
+ 
+ def process_log(

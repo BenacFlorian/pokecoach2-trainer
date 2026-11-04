@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
 
+from pokecoach_trainer.errors import InvalidConfiguration
 from pokecoach_trainer.jobs import get_job
 from pokecoach_trainer.schemas import ExperimentConfig
 from pokecoach_trainer.settings import storage_path
@@ -21,7 +22,7 @@ def create_job(config: ExperimentConfig):
         if "occupé" in str(exc):
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except ValueError as exc:
+    except (ValueError, InvalidConfiguration) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return record
 

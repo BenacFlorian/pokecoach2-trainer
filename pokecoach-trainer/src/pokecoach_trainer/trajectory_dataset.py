@@ -6,9 +6,14 @@ import pickle
 from pathlib import Path
 
 import numpy as np
+import torch
 from imitation.data.types import DictObs, Trajectory
 from torch.utils.data import Dataset
+from vgc_bench.src.policy import MaskedActorCriticPolicy
 from vgc_bench.src.utils import act_len
+
+from pokecoach_trainer.compatibility import ModelContract
+from pokecoach_trainer.errors import BlockingMaskError
 
 
 def synthetic_bc_mask(n_steps: int) -> np.ndarray:
@@ -48,6 +53,93 @@ def assert_actions_allowed(traj: Trajectory, replay_id: str) -> None:
         if mask[step, a1] == 0 or mask[step, act_len + a2] == 0:
             raise ValueError(
                 f"action interdite par masque BC replay={replay_id} step={step} acts=({a1},{a2})"
+            )
+
+
+def validate_trajectory_contract(
+    traj: Trajectory,
+    contract: ModelContract,
+    *,
+    replay_id: str,
+    player_side: str,
+) -> None:
+    """
+    Contrôle dimensions, bornes et masque conditionnel BC.
+
+    Raises:
+        BlockingMaskError: cible interdite bloquante pour toute la publication.
+        ValueError: forme incohérente ou transition vide.
+    """
+
+    if len(traj.acts) == 0:
+        raise ValueError("trajectoire sans transitions")
+    obs = _obs_arrays(traj.obs)
+    observation = obs.get("observation")
+    if observation is None:
+        raise ValueError("observation manquante")
+    obs_arr = np.asarray(observation)
+    if obs_arr.shape[0] != len(traj.acts) + 1:
+        raise ValueError("len(obs) doit valoir len(acts)+1")
+    if not np.isfinite(obs_arr).all():
+        raise ValueError("observation non finie")
+
+    acts = np.asarray(traj.acts)
+    if acts.ndim != 2 or acts.shape[1] != 2:
+        raise ValueError("actions attendues (steps, 2)")
+    max_index = 2 * contract.act_len - 1
+    for step, (a1, a2) in enumerate(acts):
+        if a1 < 0 or a2 < 0 or a1 >= contract.act_len or a2 >= contract.act_len:
+            raise BlockingMaskError(
+                "action_index_out_of_bounds",
+                details={
+                    "replay_id": replay_id,
+                    "player_side": player_side,
+                    "step": step,
+                    "actions": [int(a1), int(a2)],
+                    "act_len": contract.act_len,
+                },
+            )
+
+    mask_arr = obs.get("action_mask")
+    if mask_arr is None:
+        mask_arr = synthetic_bc_mask(len(traj.acts) + 1)
+    mask_np = np.asarray(mask_arr, dtype=np.float32)
+    for step, (a1, a2) in enumerate(acts):
+        if mask_np[step, a1] == 0:
+            raise BlockingMaskError(
+                "blocking_mask_first_target",
+                details={
+                    "replay_id": replay_id,
+                    "player_side": player_side,
+                    "step": step,
+                    "actions": [int(a1), int(a2)],
+                    "mask_slice": mask_np[step].tolist(),
+                },
+            )
+        mask_t = torch.as_tensor(mask_np[step : step + 1].copy())
+        updated = MaskedActorCriticPolicy._update_mask(
+            mask_t, torch.tensor([[int(a1)]])
+        )
+        if updated[0, act_len + int(a2)] == 0:
+            raise BlockingMaskError(
+                "blocking_mask_second_target",
+                details={
+                    "replay_id": replay_id,
+                    "player_side": player_side,
+                    "step": step,
+                    "actions": [int(a1), int(a2)],
+                    "mask_slice": updated[0].tolist(),
+                },
+            )
+        if int(a2) >= max_index:
+            raise BlockingMaskError(
+                "action_index_out_of_bounds",
+                details={
+                    "replay_id": replay_id,
+                    "player_side": player_side,
+                    "step": step,
+                    "actions": [int(a1), int(a2)],
+                },
             )
 
 

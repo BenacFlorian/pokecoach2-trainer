@@ -1,0 +1,9 @@
+collection:
+  format_ids:
+    - mc
+  max_new_replays: 40
+  max_requests: 200
+  max_duration_s: 600
+  request_interval_s: 1
+  timeout_s: 30
+  max_attempts: 5

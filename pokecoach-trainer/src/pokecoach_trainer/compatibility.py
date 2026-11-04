@@ -29,10 +29,11 @@ def _canonical_json(data: object) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":"))
 
 
-def build_contract(model: ModelConfig | None = None) -> ModelContract:
-    """Calcule l'empreinte à partir des sources et règles de masque."""
+def build_contract(model: ModelConfig) -> ModelContract:
+    """Calcule l'empreinte à partir des sources, règles de masque et architecture explicite."""
 
-    model = model or ModelConfig()
+    if model is None:
+        raise TypeError("ModelConfig requis ; aucune architecture Tiny implicite")
     root = get_settings().vgc_bench_root
     with root.joinpath("vgc_bench/src/utils.py").open("rb") as f:
         utils_hash = hashlib.sha256(f.read()).hexdigest()
@@ -64,4 +65,19 @@ def build_contract(model: ModelConfig | None = None) -> ModelContract:
         poke_env_commit=POKE_ENV_COMMIT,
         act_len=act_len,
         mask_rules=payload["bc_synthetic_mask"],
+    )
+
+
+def contracts_compatible(left: ModelContract, right: ModelContract) -> bool:
+    """
+    Vérifie l'égalité sémantique de deux contrats (empreinte versionnée).
+
+    Une permutation de tables à dimensions identiques produit une empreinte différente
+    via les hashes des sources `policy.py` / `utils.py` et l'architecture explicite.
+    """
+
+    return (
+        left.fingerprint == right.fingerprint
+        and left.act_len == right.act_len
+        and left.vgc_bench_commit == right.vgc_bench_commit
     )

@@ -15,6 +15,29 @@ from pokecoach_trainer.upstream import vgc_bench_workdir
 
 def verify_reload(model_path: Path, manifest_path: Path) -> ReloadReport:
     manifest = read_json(manifest_path)
+    schema_version = int(manifest.get("schema_version") or 1)
+    arch_raw = manifest.get("architecture")
+    if not isinstance(arch_raw, dict):
+        return ReloadReport(
+            ok=False,
+            checkpoint_sha256="",
+            param_count=0,
+            architecture=ModelConfig(),
+            message="architecture manifest absente",
+        )
+    try:
+        if schema_version >= 2:
+            arch = ModelConfig.model_validate(arch_raw)
+        else:
+            arch = ModelConfig.model_validate({**ModelConfig().model_dump(), **arch_raw})
+    except Exception as exc:
+        return ReloadReport(
+            ok=False,
+            checkpoint_sha256="",
+            param_count=0,
+            architecture=ModelConfig(),
+            message=f"architecture manifest invalide: {exc}",
+        )
     expected_hash = manifest.get("checkpoint_sha256", "")
     digest = sha256_file(model_path)
     if expected_hash and digest != expected_hash:
@@ -22,10 +45,9 @@ def verify_reload(model_path: Path, manifest_path: Path) -> ReloadReport:
             ok=False,
             checkpoint_sha256=digest,
             param_count=0,
-            architecture=ModelConfig(),
+            architecture=arch,
             message="hash checkpoint incorrect",
         )
-    arch = ModelConfig.model_validate(manifest.get("architecture", {}))
     with vgc_bench_workdir():
         from vgc_bench.src.policy import MaskedActorCriticPolicy
 

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-11-03",
+  "regulation_target": "M-C",
+  "vgc_bench_commit_expected": "d79f9532947ac114dce1dda2456a590afcd375b2",
+  "format_registry": {
+    "mc": {
+      "status": "registered",
+      "collection_supported": true,
+      "conversion_supported": true,
+      "source": "configs/formats.json"
+    }
+  },
+  "parent_checkpoint": {
+    "status": "to_register",
+    "notes": "Enregistrer via `base-model register` après identification du checkpoint M-B de confiance (REFERENCE_CHECKPOINT_PATH ou profil PokeCoach)."
+  },
+  "encoding_contract": {
+    "status": "implemented_in_trainer",
+    "notes": "build_contract(ModelConfig) obligatoire ; empreinte dataset.encoding_contract_fingerprint sur manifestes v2."
+  },
+  "showdown_local": {
+    "status": "not_verified_in_this_session",
+    "notes": "Preuve combats M-C réels : lot E tâche 16."
+  }
+}

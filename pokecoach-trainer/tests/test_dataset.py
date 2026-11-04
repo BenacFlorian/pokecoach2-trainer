@@ -86,7 +86,7 @@ def test_write_prepared_trajectories_split_by_replay_id(tmp_path, monkeypatch):
 def test_process_logs_with_provenance_keeps_metadata(monkeypatch):
     from concurrent.futures import Future
 
-    from vgc_bench.logs2trajs import TaggedTrajectory, process_logs_with_provenance
+    from vgc_bench.logs2trajs import process_logs_with_provenance
 
     traj_a = _fake_traj()
     traj_b = _fake_traj(steps=2)
@@ -113,9 +113,10 @@ def test_process_logs_with_provenance_keeps_metadata(monkeypatch):
 def test_prepare_dataset_runs_without_force(tmp_path, monkeypatch):
     import json
 
+    from vgc_bench.logs2trajs import TaggedTrajectory
+
     from pokecoach_trainer.dataset_service import prepare_dataset
     from pokecoach_trainer.schemas import PrepareConfig
-    from vgc_bench.logs2trajs import TaggedTrajectory
 
     monkeypatch.setenv("TRAINER_STORAGE_ROOT", str(tmp_path / "storage"))
     clear_settings_cache()
