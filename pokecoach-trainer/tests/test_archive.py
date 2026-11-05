@@ -67,14 +67,17 @@ def test_archive_rejects_id_mismatch(archive_env):
 
 
 def test_rebuild_index_from_objects(archive_env):
+    from pokecoach_trainer.archive_catalog import catalog_has_replay
+
     source = ArchiveSource(provenance="test", fetched_at=datetime.now(timezone.utc))
     replay_id = "gen9championsvgc2026regmc-rebuild"
     archive_replay(replay_id, _payload(replay_id, "|turn|1\n"), source)
     index_path = storage_path("archive", "index", "replays.jsonl")
-    index_path.unlink()
+    if index_path.is_file():
+        index_path.unlink()
     count = rebuild_index_from_objects()
     assert count == 1
-    assert load_index_entries()[0]["replay_id"] == replay_id
+    assert catalog_has_replay(archive_env, replay_id)
 
 
 def test_import_legacy_logs_deduplicates(archive_env):

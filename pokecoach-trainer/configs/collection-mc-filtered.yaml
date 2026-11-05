@@ -1,0 +1,12 @@
+collection:
+  format_ids:
+    - mc
+  upload_after: "2026-01-01T00:00:00Z"
+  upload_before: "2026-06-01T00:00:00Z"
+  teams_file: teams.example.json
+  max_selected_replays: 50000
+  max_requests: 100000
+  max_duration_s: 86400
+  requests_per_s: 2
+  discovery_workers: 2
+  download_workers: 8

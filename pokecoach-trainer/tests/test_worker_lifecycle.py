@@ -17,44 +17,29 @@ from pokecoach_trainer.schemas import (
 )
 
 
-def test_only_one_long_job_across_types(tmp_path, monkeypatch):
+def test_collection_and_one_compute_job_can_coexist(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRAINER_STORAGE_ROOT", str(tmp_path))
+    from pokecoach_trainer.jobs import acquire_resource_lock, release_resource_lock
+    from pokecoach_trainer.settings import clear_settings_cache, ensure_storage_layout
+
+    clear_settings_cache()
+    ensure_storage_layout()
+    cfd = acquire_resource_lock("collection", "camp-1")
+    comp_fd = acquire_resource_lock("compute", "prep-1")
+    release_resource_lock(comp_fd)
+    release_resource_lock(cfd)
+
+
+def test_second_compute_job_conflicts(tmp_path, monkeypatch):
     monkeypatch.setenv("TRAINER_STORAGE_ROOT", str(tmp_path))
     from pokecoach_trainer.settings import clear_settings_cache, ensure_storage_layout
 
     clear_settings_cache()
     ensure_storage_layout()
-
-    hold_script = tmp_path / "hold_lock.py"
-    pkg_root = Path(__file__).resolve().parents[1]
-    hold_script.write_text(
-        f"""
-import os
-import sys
-import time
-from pathlib import Path
-root = Path({str(pkg_root)!r})
-sys.path.insert(0, str(root / "src"))
-os.chdir(root / "vendor" / "vgc-bench")
-os.environ["TRAINER_STORAGE_ROOT"] = {str(tmp_path)!r}
-from pokecoach_trainer.settings import clear_settings_cache
-from pokecoach_trainer.jobs import acquire_job_lock
-clear_settings_cache()
-acquire_job_lock("blocking")
-time.sleep(3)
-""",
-        encoding="utf-8",
-    )
-    blocker = subprocess.Popen(
-        [sys.executable, str(hold_script)],
-        cwd=str(Path(__file__).resolve().parents[1]),
-    )
-    try:
-        time.sleep(0.5)
-        cfg = CollectionJobConfig(config=CollectionConfig(format_ids=["mc"]))
-        with pytest.raises(Conflict):
-            submit_job(JobKind.collection, cfg)
-    finally:
-        blocker.wait(timeout=10)
+    fd_a = acquire_job_lock("job-a")
+    with pytest.raises(RuntimeError):
+        acquire_job_lock("job-b")
+    release_job_lock("job-a", fd_a)
 
 
 def test_queued_record_before_lock(tmp_path, monkeypatch):
@@ -75,3 +60,20 @@ def test_queued_record_before_lock(tmp_path, monkeypatch):
     assert loaded.status == JobStatus.queued
     fd = acquire_job_lock(job_id)
     release_job_lock(job_id, fd)
+
+
+def test_import_prepare_keeps_compute_lock_after_api_restart(tmp_path, monkeypatch):
+    """Le verrou compute reste pris tant que le détenteur ne libère pas explicitement."""
+    monkeypatch.setenv("TRAINER_STORAGE_ROOT", str(tmp_path))
+    from pokecoach_trainer.settings import clear_settings_cache, ensure_storage_layout
+
+    clear_settings_cache()
+    ensure_storage_layout()
+    fd = acquire_job_lock("job-prepare-lock")
+    try:
+        with pytest.raises(RuntimeError):
+            acquire_job_lock("job-other")
+    finally:
+        release_job_lock("job-prepare-lock", fd)
+    fd2 = acquire_job_lock("job-after-release")
+    release_job_lock("job-after-release", fd2)

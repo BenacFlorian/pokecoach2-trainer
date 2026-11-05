@@ -66,6 +66,12 @@ def ensure_storage_layout() -> None:
         storage_path(name).mkdir(parents=True, exist_ok=True)
 
 
+def archive_catalog_file() -> Path:
+    """Chemin du catalogue SQLite sous la racine de stockage."""
+
+    return storage_path("archive", "catalog.sqlite3")
+
+
 def load_dotenv_explicit() -> None:
     env = _env_file()
     if not env.is_file():

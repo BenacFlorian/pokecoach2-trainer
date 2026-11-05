@@ -3,7 +3,7 @@ import pytest
 
 from pokecoach_trainer.collection_client import ShowdownReplayClient
 from pokecoach_trainer.collection_service import collect_replays
-from pokecoach_trainer.errors import InvalidConfiguration
+from pokecoach_trainer.errors import InvalidConfiguration, ProviderInvalidPayload, ProviderRateLimited
 from pokecoach_trainer.schemas import CollectionConfig
 from pokecoach_trainer.settings import clear_settings_cache, ensure_storage_layout
 
@@ -113,29 +113,20 @@ def test_fetch_invalid_json(collection_env):
         return httpx.Response(200, text="not-json")
 
     client = ShowdownReplayClient(transport=httpx.MockTransport(handler), sleep=lambda _: None)
-    with pytest.raises(InvalidConfiguration):
+    with pytest.raises(ProviderInvalidPayload):
         client.fetch(REPLAY_ID)
     client.close()
 
 
-def test_client_retries_429(collection_env):
-    attempts = {"n": 0}
-
+def test_client_single_attempt_on_429(collection_env):
     def handler(request: httpx.Request) -> httpx.Response:
-        attempts["n"] += 1
-        if attempts["n"] == 1:
-            return httpx.Response(429, headers={"Retry-After": "0"})
-        return httpx.Response(
-            200,
-            json={"id": REPLAY_ID, "uploadtime": 1, "log": "|turn|1\n", "format": SOURCE_FORMAT},
-        )
+        return httpx.Response(429, headers={"Retry-After": "0"})
 
-    sleeps: list[float] = []
     client = ShowdownReplayClient(
         transport=httpx.MockTransport(handler),
-        sleep=sleeps.append,
-        max_attempts=3,
+        sleep=lambda _: None,
     )
-    payload = client.fetch(REPLAY_ID)
-    assert payload["id"] == REPLAY_ID
+    with pytest.raises(ProviderRateLimited):
+        client.fetch(REPLAY_ID)
+    assert client.request_count == 1
     client.close()

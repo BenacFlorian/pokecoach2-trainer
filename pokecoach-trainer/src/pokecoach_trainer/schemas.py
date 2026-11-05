@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_SHOWDOWN_SPECIES_ID = re.compile(r"^[a-z0-9]+$")
 
 
 class ModelConfig(BaseModel):
@@ -173,18 +176,99 @@ class DatasetRecipe(BaseModel):
         return merged
 
 
-class CollectionConfig(BaseModel):
+class TeamFilter(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    teams: list[list[str]]
+
+    @field_validator("teams")
+    @classmethod
+    def _teams_shape(cls, teams: list[list[str]]) -> list[list[str]]:
+        if not teams:
+            raise ValueError("liste d'équipes vide")
+        normalized: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for team in teams:
+            if len(team) != 6:
+                raise ValueError("chaque composition doit contenir exactement six identifiants")
+            ids: list[str] = []
+            for raw in team:
+                sid = str(raw).strip().lower()
+                if not sid or not _SHOWDOWN_SPECIES_ID.fullmatch(sid):
+                    raise ValueError(f"identifiant Showdown invalide: {raw!r}")
+                ids.append(sid)
+            key = tuple(sorted(ids))
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(sorted(ids))
+        return normalized
+
+
+class CollectionBudgets(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_selected_replays: int
+    max_requests: int
+    max_duration_s: int
+
+    @field_validator("max_selected_replays", "max_requests", "max_duration_s")
+    @classmethod
+    def _positive_int(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("budget entier strictement positif requis")
+        return v
+
+
+class ResumeCollectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_attempt: bool = False
+    budgets: CollectionBudgets | None = None
+
+
+class ScaleCollectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    discovery_workers: int
+    download_workers: int
+
+
+class RetryFailedRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_attempts: int = 5
+    replay_ids: list[str] | None = None
+
+
+class CollectionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     format_ids: list[str]
     upload_after: datetime | None = None
     upload_before: datetime | None = None
-    max_new_replays: int = 5000
+    max_selected_replays: int = Field(
+        default=5000,
+        validation_alias=AliasChoices("max_selected_replays", "max_new_replays"),
+    )
     max_requests: int = 10000
     max_duration_s: int = 7200
-    request_interval_s: float = 1.0
+    requests_per_s: float = 1.0
+    request_interval_s: float | None = None
     timeout_s: float = 30.0
     max_attempts: int = 5
+    discovery_workers: int = 1
+    download_workers: int = 1
+    window_days: int = 7
+    queue_high_water: int = 10_000
+    lease_duration_s: int = 120
+    heartbeat_s: int = 15
+    mode: Literal["backfill", "incremental"] = "backfill"
+    incremental_overlap_hours: int = 48
+    reinspect: bool = False
+    shutdown_grace_s: int = 60
+    team_filter: TeamFilter | None = None
+    effective_upload_before: datetime | None = Field(default=None, exclude=True)
 
     @field_validator("format_ids")
     @classmethod
@@ -193,11 +277,47 @@ class CollectionConfig(BaseModel):
             raise ValueError("format_ids ne peut pas être vide")
         return v
 
+    @field_validator("upload_after", "upload_before", mode="before")
+    @classmethod
+    def _normalize_dates(cls, v: Any) -> datetime | None:
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            dt = v
+        else:
+            dt = datetime.fromisoformat(str(v))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    @field_validator("max_selected_replays", "max_requests", "max_duration_s")
+    @classmethod
+    def _budget_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("budget entier strictement positif requis")
+        return v
+
+    @field_validator("requests_per_s")
+    @classmethod
+    def _rate_finite(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0 or v > 20:
+            raise ValueError("requests_per_s doit être fini et dans (0, 20]")
+        return v
+
     @field_validator("request_interval_s")
     @classmethod
-    def _interval_min(cls, v: float) -> float:
-        if v < 1.0:
+    def _interval_finite(cls, v: float | None) -> float | None:
+        if v is None:
+            return None
+        if not math.isfinite(v) or v < 1.0:
             raise ValueError("request_interval_s doit être >= 1")
+        return v
+
+    @field_validator("timeout_s")
+    @classmethod
+    def _timeout_range(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 1 or v > 120:
+            raise ValueError("timeout_s doit être entre 1 et 120")
         return v
 
     @field_validator("max_attempts")
@@ -207,12 +327,96 @@ class CollectionConfig(BaseModel):
             raise ValueError("max_attempts doit être entre 1 et 5")
         return v
 
+    @field_validator("discovery_workers")
+    @classmethod
+    def _discovery_pool(cls, v: int) -> int:
+        if v < 1 or v > 8:
+            raise ValueError("discovery_workers doit être entre 1 et 8")
+        return v
+
+    @field_validator("download_workers")
+    @classmethod
+    def _download_pool(cls, v: int) -> int:
+        if v < 1 or v > 64:
+            raise ValueError("download_workers doit être entre 1 et 64")
+        return v
+
+    @field_validator("window_days")
+    @classmethod
+    def _window_days(cls, v: int) -> int:
+        if v < 1 or v > 30:
+            raise ValueError("window_days doit être entre 1 et 30")
+        return v
+
+    @field_validator("queue_high_water")
+    @classmethod
+    def _queue_hw(cls, v: int) -> int:
+        if v < 100 or v > 100_000:
+            raise ValueError("queue_high_water doit être entre 100 et 100000")
+        return v
+
+    @field_validator("lease_duration_s")
+    @classmethod
+    def _lease_duration(cls, v: int) -> int:
+        if v < 30 or v > 3600:
+            raise ValueError("lease_duration_s doit être entre 30 et 3600")
+        return v
+
+    @field_validator("heartbeat_s")
+    @classmethod
+    def _heartbeat(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("heartbeat_s doit être >= 1")
+        return v
+
+    @field_validator("incremental_overlap_hours")
+    @classmethod
+    def _overlap(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("incremental_overlap_hours doit être >= 1")
+        return v
+
+    @field_validator("shutdown_grace_s")
+    @classmethod
+    def _grace(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("shutdown_grace_s doit être >= 1")
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        payload = dict(data)
+        if "max_new_replays" in payload and "max_selected_replays" in payload:
+            raise ValueError("max_new_replays et max_selected_replays sont exclusifs")
+        has_interval = "request_interval_s" in payload
+        has_rate = "requests_per_s" in payload
+        if (
+            has_interval
+            and has_rate
+            and payload.get("request_interval_s") is not None
+            and payload.get("requests_per_s") is not None
+        ):
+            raise ValueError("request_interval_s et requests_per_s sont exclusifs")
+        if has_interval and not has_rate:
+            interval = float(payload["request_interval_s"])
+            payload["requests_per_s"] = 1.0 / interval
+        return payload
+
     @model_validator(mode="after")
-    def _date_order(self) -> CollectionConfig:
+    def _date_order_and_lease(self) -> CollectionConfig:
         if self.upload_after and self.upload_before:
-            if self.upload_after > self.upload_before:
+            if self.upload_after >= self.upload_before:
                 raise ValueError("upload_after doit précéder upload_before")
+        if self.heartbeat_s * 3 > self.lease_duration_s:
+            raise ValueError("heartbeat_s * 3 doit être <= lease_duration_s")
         return self
+
+    @property
+    def legacy_request_interval_s(self) -> float:
+        return 1.0 / self.requests_per_s
 
 
 class SnapshotRequest(BaseModel):
@@ -283,6 +487,8 @@ class CollectionResult(BaseModel):
     """Résultat d'un job de collecte."""
 
     new_replays: int = 0
+    selected_replays: int = 0
+    reused_replays: int = 0
     skipped_existing: int = 0
     failed_replays: int = 0
     total_requests: int = 0

@@ -1,0 +1,13 @@
+collection:
+  format_ids:
+    - mc
+  mode: incremental
+  incremental_overlap_hours: 48
+  max_selected_replays: 5000
+  max_requests: 10000
+  max_duration_s: 3600
+  requests_per_s: 2
+  discovery_workers: 2
+  download_workers: 4
+  window_days: 7
+  queue_high_water: 5000

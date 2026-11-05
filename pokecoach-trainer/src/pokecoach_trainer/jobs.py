@@ -1,4 +1,4 @@
-"""État persistant des jobs et verrou inter-processus (fcntl)."""
+"""État persistant des jobs et verrous inter-processus (fcntl)."""
 
 from __future__ import annotations
 
@@ -7,12 +7,13 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
-from pokecoach_trainer.schemas import ExperimentConfig, JobRecord, JobStatus
+from pokecoach_trainer.schemas import ExperimentConfig, JobKind, JobRecord, JobStatus
 from pokecoach_trainer.settings import storage_path
 from pokecoach_trainer.storage import validate_id, write_json_atomic
 
-_lock_fd: int | None = None
+_compute_lock_fd: int | None = None
 
 
 def _job_dir(job_id: str) -> Path:
@@ -23,8 +24,9 @@ def _state_path(job_id: str) -> Path:
     return _job_dir(job_id) / "state.json"
 
 
-def _lock_path() -> Path:
-    return storage_path("jobs", ".long_job.lock")
+def _lock_path(resource: Literal["collection", "compute"]) -> Path:
+    name = ".collection.lock" if resource == "collection" else ".compute.lock"
+    return storage_path("jobs", name)
 
 
 def save_job(record: JobRecord) -> None:
@@ -40,15 +42,11 @@ def get_job(job_id: str) -> JobRecord:
     return JobRecord.model_validate(json.loads(path.read_text(encoding="utf-8")))
 
 
-def acquire_job_lock(job_id: str) -> int:
-    """
-    Réserve le slot de job long via flock(2) sur un inode stable.
+def acquire_resource_lock(resource: Literal["collection", "compute"], job_id: str) -> int:
+    """Réserve un slot via flock sur .collection.lock ou .compute.lock."""
 
-    Le descripteur doit rester ouvert jusqu'à la fin du worker (héritage pass_fds).
-    """
-
-    global _lock_fd
-    path = _lock_path()
+    global _compute_lock_fd
+    path = _lock_path(resource)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -59,27 +57,35 @@ def acquire_job_lock(job_id: str) -> int:
     os.ftruncate(fd, 0)
     os.write(fd, job_id.encode())
     os.fsync(fd)
-    _lock_fd = fd
+    if resource == "compute":
+        _compute_lock_fd = fd
     return fd
 
 
+def release_resource_lock(fd: int) -> None:
+    global _compute_lock_fd
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+        if fd == _compute_lock_fd:
+            _compute_lock_fd = None
+
+
+def acquire_job_lock(job_id: str) -> int:
+    return acquire_resource_lock("compute", job_id)
+
+
 def release_job_lock(job_id: str, fd: int | None = None) -> None:
-    global _lock_fd
-    use_fd = fd if fd is not None else _lock_fd
+    global _compute_lock_fd
+    use_fd = fd if fd is not None else _compute_lock_fd
     if use_fd is None:
         return
-    try:
-        fcntl.flock(use_fd, fcntl.LOCK_UN)
-    finally:
-        os.close(use_fd)
-        if use_fd == _lock_fd:
-            _lock_fd = None
+    release_resource_lock(use_fd)
 
 
 def acquire_training_lock(job_id: str) -> int:
-    """Compatibilité : alias vers le verrou unique des jobs longs."""
-
-    return acquire_job_lock(job_id)
+    return acquire_resource_lock("compute", job_id)
 
 
 def release_training_lock(job_id: str) -> None:
@@ -87,19 +93,22 @@ def release_training_lock(job_id: str) -> None:
 
 
 def reconcile_jobs() -> None:
-    """Marque les jobs orphelins comme interrompus au redémarrage."""
+    """Marque les jobs JSON orphelins ; ne touche pas aux campagnes SQLite actives."""
 
     jobs_root = storage_path("jobs")
     if not jobs_root.is_dir():
         return
     for state_file in jobs_root.glob("*/state.json"):
         record = JobRecord.model_validate(json.loads(state_file.read_text(encoding="utf-8")))
+        if record.kind == JobKind.collection:
+            continue
         if record.status in {JobStatus.running, JobStatus.queued}:
             record.status = JobStatus.interrupted
             record.finished_at = datetime.now(timezone.utc)
             record.error = record.error or "interrupted at reconcile"
             save_job(record)
-    release_job_lock("reconcile", _lock_fd)
+    if _compute_lock_fd is not None:
+        release_resource_lock(_compute_lock_fd)
 
 
 def write_job_config(job_id: str, config: ExperimentConfig) -> Path:

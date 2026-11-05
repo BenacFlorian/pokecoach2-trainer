@@ -56,7 +56,7 @@ def test_dataset_recipe_alias_contradiction():
 
 def test_collection_config_bounds():
     cfg = CollectionConfig(format_ids=["mc"])
-    assert cfg.max_new_replays == 5000
+    assert cfg.max_selected_replays == 5000
     assert cfg.max_attempts == 5
 
 

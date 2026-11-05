@@ -30,6 +30,7 @@ from pokecoach_trainer.dataset_service import (
     submit_preparation,
 )
 from pokecoach_trainer.jobs import get_job
+from pokecoach_trainer.errors import InvalidConfiguration
 from pokecoach_trainer.schemas import (
     BaseModelSource,
     CollectionConfig,
@@ -218,7 +219,15 @@ def _cmd_base_model(args: argparse.Namespace) -> int:
 def _load_collection_config(path: Path) -> CollectionConfig:
     path = _resolve_user_path(path)
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    block = data.get("collection", data)
+    block = dict(data.get("collection", data))
+    teams_file = block.pop("teams_file", None)
+    if teams_file is not None and block.get("team_filter") is not None:
+        raise InvalidConfiguration("teams_file et team_filter sont exclusifs")
+    if teams_file is not None:
+        from pokecoach_trainer.collection_filters import load_team_filter
+
+        team_path = (path.parent / str(teams_file)).resolve()
+        block["team_filter"] = load_team_filter(team_path).model_dump(mode="json")
     return CollectionConfig.model_validate(block)
 
 
@@ -230,15 +239,100 @@ def _load_snapshot_request(path: Path) -> SnapshotRequest:
 
 
 def _cmd_collection(args: argparse.Namespace) -> int:
+    from pokecoach_trainer.collection_service import (
+        get_collection,
+        pause_collection,
+        resume_collection,
+        retry_failed_collection,
+        scale_collection,
+        stop_collection,
+    )
+    from pokecoach_trainer.schemas import ResumeCollectionRequest, RetryFailedRequest, ScaleCollectionRequest
+
     ensure_storage_layout()
     if args.collection_cmd == "start":
         config = _load_collection_config(Path(args.config))
         record = submit_collection(config)
+        from pokecoach_trainer.collection_logging import campaign_log_path
+        from pokecoach_trainer.settings import get_settings
+
+        log_path = campaign_log_path(record.job_id)
         print(record.model_dump_json(indent=2))
+        print(
+            f"\nSuivre la progression:\n"
+            f"  export TRAINER_STORAGE_ROOT={get_settings().storage_root}\n"
+            f"  devbox run cli -- collection logs --job-id {record.job_id} --follow\n"
+            f"Journal: {log_path}",
+            file=sys.stderr,
+        )
     elif args.collection_cmd == "status":
-        record = get_job(args.job_id)
-        print(record.model_dump_json(indent=2))
+        view = get_collection(args.job_id)
+        print(view.job.model_dump_json(indent=2))
+    elif args.collection_cmd == "pause":
+        print(pause_collection(args.job_id).job.model_dump_json(indent=2))
+    elif args.collection_cmd == "stop":
+        print(stop_collection(args.job_id).job.model_dump_json(indent=2))
+    elif args.collection_cmd == "resume":
+        budgets = None
+        if args.new_attempt:
+            if not args.budgets:
+                print("budgets requis avec --new-attempt", file=sys.stderr)
+                return 2
+            budgets = _load_budgets(Path(args.budgets))
+        elif args.budgets:
+            print("--budgets sans --new-attempt interdit", file=sys.stderr)
+            return 2
+        req = ResumeCollectionRequest(new_attempt=args.new_attempt, budgets=budgets)
+        print(resume_collection(args.job_id, req).job.model_dump_json(indent=2))
+    elif args.collection_cmd == "scale":
+        req = ScaleCollectionRequest(
+            discovery_workers=args.discovery_workers,
+            download_workers=args.download_workers,
+        )
+        print(scale_collection(args.job_id, req).job.model_dump_json(indent=2))
+    elif args.collection_cmd == "retry-failed":
+        req = RetryFailedRequest(max_attempts=args.max_attempts)
+        count = retry_failed_collection(args.job_id, req)
+        print(json.dumps({"retried": count}, indent=2))
+    elif args.collection_cmd == "logs":
+        from pokecoach_trainer.collection_logging import campaign_log_path, worker_log_path
+        from pokecoach_trainer.job_service import read_collection_worker_logs, read_job_logs
+
+        if args.worker_id:
+            lines = read_collection_worker_logs(args.job_id, args.worker_id, tail=args.tail)
+        else:
+            lines = read_job_logs(args.job_id, tail=args.tail)
+        if args.follow:
+            log_path = (
+                worker_log_path(args.job_id, args.worker_id)
+                if args.worker_id
+                else campaign_log_path(args.job_id)
+            )
+            if not log_path.is_file():
+                print(f"journal absent: {log_path}", file=sys.stderr)
+                return 1
+            import time as _time
+
+            with log_path.open("r", encoding="utf-8") as handle:
+                handle.seek(0, 2)
+                while True:
+                    line = handle.readline()
+                    if line:
+                        print(line, end="")
+                    else:
+                        _time.sleep(0.5)
+        else:
+            print("\n".join(lines))
     return 0
+
+
+def _load_budgets(path: Path):
+    from pokecoach_trainer.schemas import CollectionBudgets
+
+    path = _resolve_user_path(path)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    block = data.get("budgets", data)
+    return CollectionBudgets.model_validate(block)
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:
@@ -276,6 +370,30 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             )
         )
         print(f"snapshot_id={snapshot.snapshot_id}")
+    elif args.archive_cmd == "export-index":
+        from pokecoach_trainer.archive_catalog import export_catalog_jsonl
+        from pokecoach_trainer.settings import get_settings
+
+        out = _resolve_user_path(Path(args.output))
+        count = export_catalog_jsonl(get_settings().storage_root, out)
+        print(json.dumps({"exported": count, "path": str(out)}, indent=2))
+    elif args.archive_cmd == "backup":
+        from pokecoach_trainer.archive_catalog import backup_catalog
+        from pokecoach_trainer.settings import get_settings
+
+        out = _resolve_user_path(Path(args.output))
+        backup_catalog(get_settings().storage_root, out)
+        print(json.dumps({"backup": str(out)}, indent=2))
+    elif args.archive_cmd == "rebuild-index":
+        from pokecoach_trainer.errors import Conflict
+        from pokecoach_trainer.archive_service import rebuild_index_from_objects
+
+        try:
+            count = rebuild_index_from_objects()
+        except Conflict as exc:
+            print(exc.message, file=sys.stderr)
+            return 2
+        print(json.dumps({"rebuilt": count}, indent=2))
     return 0
 
 
@@ -364,6 +482,31 @@ def main(argv: list[str] | None = None) -> int:
     collection_start.add_argument("--config", required=True)
     collection_status = collection_sub.add_parser("status")
     collection_status.add_argument("--job-id", required=True)
+    collection_pause = collection_sub.add_parser("pause")
+    collection_pause.add_argument("--job-id", required=True)
+    collection_stop = collection_sub.add_parser("stop")
+    collection_stop.add_argument("--job-id", required=True)
+    collection_resume = collection_sub.add_parser("resume")
+    collection_resume.add_argument("--job-id", required=True)
+    collection_resume.add_argument("--new-attempt", action="store_true")
+    collection_resume.add_argument("--budgets", default=None)
+    collection_scale = collection_sub.add_parser("scale")
+    collection_scale.add_argument("--job-id", required=True)
+    collection_scale.add_argument("--discovery-workers", type=int, required=True)
+    collection_scale.add_argument("--download-workers", type=int, required=True)
+    collection_retry = collection_sub.add_parser("retry-failed")
+    collection_retry.add_argument("--job-id", required=True)
+    collection_retry.add_argument("--max-attempts", type=int, default=5)
+    collection_logs = collection_sub.add_parser("logs", help="Journal superviseur ou worker")
+    collection_logs.add_argument("--job-id", required=True)
+    collection_logs.add_argument("--worker-id", default=None)
+    collection_logs.add_argument("--tail", type=int, default=100)
+    collection_logs.add_argument(
+        "--follow",
+        "-f",
+        action="store_true",
+        help="Suivre le fichier en direct (comme tail -f)",
+    )
 
     archive = sub.add_parser("archive", help="Archive brute et snapshots")
     archive_sub = archive.add_subparsers(dest="archive_cmd", required=True)
@@ -371,6 +514,11 @@ def main(argv: list[str] | None = None) -> int:
     archive_snapshot.add_argument("--config", required=True)
     archive_import = archive_sub.add_parser("import")
     archive_import.add_argument("--path", required=True, help="Chemin relatif sous storage/inbox/")
+    archive_export = archive_sub.add_parser("export-index")
+    archive_export.add_argument("--output", required=True)
+    archive_backup = archive_sub.add_parser("backup")
+    archive_backup.add_argument("--output", required=True)
+    archive_rebuild = archive_sub.add_parser("rebuild-index")
 
     args = parser.parse_args(argv)
     if args.command == "doctor":

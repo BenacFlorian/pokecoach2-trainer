@@ -98,65 +98,36 @@ def load_index_entries() -> list[dict[str, Any]]:
 
 def rebuild_index_from_objects() -> int:
     """
-    Reconstruit l'index à partir des objets publiés (ignore les fichiers temporaires).
+    Reconstruit le catalogue SQLite à partir des objets publiés.
 
     Returns:
-        Nombre d'entrées écrites.
+        Nombre d'entrées indexées.
     """
 
-    root = _archive_root() / _OBJECTS_DIR
-    entries: list[dict[str, Any]] = []
-    if root.is_dir():
-        for obj_path in sorted(root.rglob("*.json")):
-            if obj_path.name.endswith(".tmp"):
-                continue
-            try:
-                envelope = read_json(obj_path)
-            except (json.JSONDecodeError, OSError):
-                continue
-            if envelope.get("schema_version") != _ENVELOPE_VERSION:
-                continue
-            rel = obj_path.relative_to(_archive_root()).as_posix()
-            ref = envelope.get("archive_ref") or {}
-            entries.append(
-                {
-                    "replay_id": envelope.get("replay_id"),
-                    "content_sha256": envelope.get("content_sha256"),
-                    "log_sha256": envelope.get("log_sha256"),
-                    "format_id": ref.get("format_id") or envelope.get("format_id"),
-                    "uploadtime": ref.get("uploadtime"),
-                    "object_relpath": rel,
-                    "conflict": bool(envelope.get("conflict")),
-                }
-            )
-    entries.sort(
-        key=lambda e: (e.get("replay_id") or "", e.get("content_sha256") or "")
-    )
-    with _metadata_lock():
-        index_path = _index_path()
-        index_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_lines = [
-            json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            for entry in entries
-        ]
-        fd, tmp = tempfile.mkstemp(dir=index_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                for line in tmp_lines:
-                    handle.write(line + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, index_path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    return len(entries)
+    from pokecoach_trainer.archive_catalog import initialize_catalog, rebuild_catalog_from_objects
+
+    root = get_settings().storage_root
+    initialize_catalog(root)
+    return rebuild_catalog_from_objects(root)
 
 
 def _existing_versions(replay_id: str) -> list[dict[str, Any]]:
+    from pokecoach_trainer.archive_catalog import catalog_is_initialized, catalog_versions
+
+    root = get_settings().storage_root
+    if catalog_is_initialized(root):
+        return [
+            {
+                "replay_id": ref.replay_id,
+                "content_sha256": ref.content_sha256,
+                "log_sha256": ref.log_sha256,
+                "format_id": ref.format_id,
+                "uploadtime": ref.uploadtime,
+                "object_relpath": ref.object_relpath,
+                "conflict": ref.conflict,
+            }
+            for ref in catalog_versions(root, replay_id)
+        ]
     return [e for e in load_index_entries() if e.get("replay_id") == replay_id]
 
 
@@ -171,87 +142,26 @@ def archive_replay(
         Conflict: versions multiples pour le même replay_id.
     """
 
-    provider_id = payload.get("id")
-    if provider_id != replay_id:
-        raise InvalidConfiguration(
-            "identifiant replay incohérent avec la réponse fournisseur",
-            details={"requested": replay_id, "provider": provider_id},
-        )
-    if not is_champions_vgc_2026_replay_id(replay_id):
-        raise InvalidConfiguration(
-            "replay hors périmètre Champions VGC 2026 (M-A/M-B/M-C)",
-            details={"replay_id": replay_id},
-        )
-    log = payload.get("log")
-    if not isinstance(log, str) or not log:
-        raise InvalidConfiguration("log replay manquant ou invalide")
+    from pokecoach_trainer.collection_publication import prepare_replay, publish_replay
+    from pokecoach_trainer.collection_store import CollectionStore
 
-    format_id = str(payload.get("format") or "")
-    uploadtime = payload.get("uploadtime")
-    if uploadtime is not None:
-        uploadtime = int(uploadtime)
-
-    canonical = _provider_canonical(payload)
-    content_sha256 = canonical_json_sha256(canonical)
-    log_sha256 = sha256_text(log)
-    rel = f"{_OBJECTS_DIR}/{replay_id}/{content_sha256}.json"
-    object_path = _archive_root() / rel
-
-    for existing in _existing_versions(replay_id):
-        if existing.get("content_sha256") == content_sha256:
-            return ArchiveRef(
-                replay_id=replay_id,
-                content_sha256=content_sha256,
-                log_sha256=log_sha256,
-                format_id=str(existing.get("format_id") or format_id),
-                uploadtime=existing.get("uploadtime") or uploadtime,
-                object_relpath=str(existing.get("object_relpath") or rel),
-                conflict=bool(existing.get("conflict")),
-            )
-
-    conflict = False
-    for existing in _existing_versions(replay_id):
-        if existing.get("content_sha256") != content_sha256:
-            conflict = True
-            break
-
-    ref = ArchiveRef(
-        replay_id=replay_id,
-        content_sha256=content_sha256,
-        log_sha256=log_sha256,
-        format_id=format_id,
-        uploadtime=uploadtime,
-        object_relpath=rel,
-        conflict=conflict,
-    )
-    envelope = {
-        "schema_version": _ENVELOPE_VERSION,
-        "replay_id": replay_id,
-        "format_id": format_id,
-        "content_sha256": content_sha256,
-        "log_sha256": log_sha256,
-        "provider": payload,
-        "source": source.model_dump(mode="json"),
-        "archive_ref": ref.model_dump(mode="json"),
-        "conflict": conflict,
-    }
-    with _metadata_lock():
-        if object_path.is_file():
-            return ref
-        write_json_atomic(object_path, envelope)
-        append_jsonl_atomic(
-            _index_path(),
-            {
-                "replay_id": replay_id,
-                "content_sha256": content_sha256,
-                "log_sha256": log_sha256,
-                "format_id": format_id,
-                "uploadtime": uploadtime,
-                "object_relpath": rel,
-                "conflict": conflict,
-            },
-        )
-    return ref
+    root = get_settings().storage_root
+    prepared = prepare_replay(root, replay_id, payload, source)
+    store = CollectionStore(root)
+    result = publish_replay(store, prepared, lease=None)
+    if result.ref.conflict:
+        for existing in _existing_versions(replay_id):
+            if existing.get("content_sha256") != result.ref.content_sha256:
+                return ArchiveRef(
+                    replay_id=replay_id,
+                    content_sha256=result.ref.content_sha256,
+                    log_sha256=result.ref.log_sha256,
+                    format_id=result.ref.format_id,
+                    uploadtime=result.ref.uploadtime,
+                    object_relpath=result.ref.object_relpath,
+                    conflict=True,
+                )
+    return result.ref
 
 
 def _row_matches_format(
@@ -337,11 +247,36 @@ def _expand_format_filter(format_ids: list[str]) -> set[str]:
 
 def _refs_from_index(
     request: SnapshotRequest,
+    *,
+    max_publication_seq: int | None = None,
 ) -> list[ArchiveRef]:
-    entries = load_index_entries()
-    if not entries:
-        rebuild_index_from_objects()
+    from pokecoach_trainer.archive_catalog import (
+        catalog_connection,
+        catalog_index_rows,
+        catalog_is_initialized,
+    )
+
+    root = get_settings().storage_root
+    if catalog_is_initialized(root):
+        entries = catalog_index_rows(root)
+        if max_publication_seq is not None:
+            with catalog_connection(root) as conn:
+                allowed = {
+                    row["content_sha256"]
+                    for row in conn.execute(
+                        """
+                        SELECT content_sha256 FROM replay_versions
+                        WHERE publication_seq <= ?
+                        """,
+                        (max_publication_seq,),
+                    ).fetchall()
+                }
+            entries = [e for e in entries if e.get("content_sha256") in allowed]
+    else:
         entries = load_index_entries()
+        if not entries:
+            rebuild_index_from_objects()
+            entries = load_index_entries()
 
     format_filter = _expand_format_filter(request.format_ids)
     source_prefixes = _format_filter_prefixes(request.format_ids)
@@ -390,7 +325,17 @@ def create_snapshot(
 
     if not request.format_ids:
         raise InvalidConfiguration("format_ids requis pour un snapshot")
-    refs = _refs_from_index(request)
+    root = get_settings().storage_root
+    from pokecoach_trainer.archive_catalog import (
+        catalog_maintenance_shared,
+        catalog_max_publication_seq,
+        initialize_catalog,
+    )
+
+    initialize_catalog(root)
+    with catalog_maintenance_shared(root):
+        max_seq = catalog_max_publication_seq(root)
+        refs = _refs_from_index(request, max_publication_seq=max_seq)
     from pokecoach_trainer.replay_metadata import (
         extract_replay_metadata,
         metadata_to_dict,
@@ -432,6 +377,100 @@ def create_snapshot(
         format_ids=list(request.format_ids),
         upload_after=request.upload_after,
         upload_before=request.upload_before,
+        refs=refs,
+        replay_metadata=replay_metadata,
+        bo3_links_status="partial" if replay_metadata else "unknown",
+    )
+    with _metadata_lock():
+        snap_path = _archive_root() / _SNAPSHOTS_DIR / f"{snapshot_id}.json"
+        write_json_atomic(snap_path, snapshot.model_dump(mode="json"))
+    return snapshot
+
+
+def list_campaign_replays(
+    campaign_id: str,
+    *,
+    offset: int = 0,
+    limit: int = 100,
+) -> tuple[list[ArchiveRef], int]:
+    """Liste paginée des replays retenus par une campagne."""
+
+    from pokecoach_trainer.archive_catalog import (
+        catalog_connection,
+        catalog_list_campaign_replays,
+        catalog_maintenance_shared,
+        initialize_catalog,
+    )
+
+    root = get_settings().storage_root
+    initialize_catalog(root)
+    with catalog_connection(root) as conn:
+        if conn.execute(
+            "SELECT 1 FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+        ).fetchone() is None:
+            raise NotFound("campagne introuvable", details={"campaign_id": campaign_id})
+    with catalog_maintenance_shared(root):
+        return catalog_list_campaign_replays(root, campaign_id, offset=offset, limit=limit)
+
+
+def create_campaign_snapshot(campaign_id: str) -> ArchiveSnapshot:
+    """Snapshot immuable limité aux replays retenus par la campagne."""
+
+    from pokecoach_trainer.archive_catalog import (
+        catalog_connection,
+        catalog_list_campaign_replays,
+        catalog_maintenance_shared,
+        catalog_max_publication_seq,
+        initialize_catalog,
+    )
+    from pokecoach_trainer.replay_metadata import (
+        extract_replay_metadata,
+        metadata_to_dict,
+    )
+
+    root = get_settings().storage_root
+    initialize_catalog(root)
+    with catalog_connection(root) as conn:
+        row = conn.execute(
+            "SELECT effective_config_json FROM campaigns WHERE campaign_id = ?",
+            (campaign_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("campagne introuvable", details={"campaign_id": campaign_id})
+        effective_json = row["effective_config_json"]
+    with catalog_maintenance_shared(root):
+        max_seq = catalog_max_publication_seq(root)
+        refs, _ = catalog_list_campaign_replays(
+            root,
+            campaign_id,
+            offset=0,
+            limit=1_000_000,
+            max_publication_seq=max_seq,
+        )
+    replay_metadata: dict[str, dict[str, Any]] = {}
+    for ref in refs:
+        try:
+            replay_metadata[ref.replay_id] = metadata_to_dict(extract_replay_metadata(ref))
+        except (ValueError, OSError):
+            continue
+    effective = json.loads(effective_json)
+    format_ids = sorted(effective.get("format_ids") or [])
+    payload = {
+        "campaign_id": campaign_id,
+        "format_ids": format_ids,
+        "refs": [r.model_dump(mode="json") for r in refs],
+        "metadata_version": 2,
+        "replay_metadata": replay_metadata,
+    }
+    snapshot_sha256 = canonical_json_sha256(payload)
+    snapshot_id = new_opaque_id("snap-")
+    snapshot = ArchiveSnapshot(
+        snapshot_id=snapshot_id,
+        snapshot_sha256=snapshot_sha256,
+        metadata_version=2,
+        format_ids=format_ids,
+        upload_after=None,
+        upload_before=None,
         refs=refs,
         replay_metadata=replay_metadata,
         bo3_links_status="partial" if replay_metadata else "unknown",
@@ -537,6 +576,32 @@ def list_replays(
 
     limit = max(1, min(limit, 1000))
     offset = max(0, offset)
+    from pokecoach_trainer.archive_catalog import catalog_is_initialized, catalog_list_replays
+
+    root = get_settings().storage_root
+    if catalog_is_initialized(root):
+        from pokecoach_trainer.archive_catalog import catalog_maintenance_shared, initialize_catalog
+
+        initialize_catalog(root)
+        after_ts = (
+            int(upload_after.replace(tzinfo=timezone.utc).timestamp())
+            if upload_after
+            else None
+        )
+        before_ts = (
+            int(upload_before.replace(tzinfo=timezone.utc).timestamp())
+            if upload_before
+            else None
+        )
+        with catalog_maintenance_shared(root):
+            return catalog_list_replays(
+                root,
+                offset=offset,
+                limit=limit,
+                format_id=format_id,
+                upload_after_ts=after_ts,
+                upload_before_ts=before_ts,
+            )
     entries = load_index_entries()
     format_ids = [format_id] if format_id else None
     refs = _index_rows_to_refs(
@@ -561,6 +626,12 @@ def read_archived_object(replay_id: str, content_sha256: str) -> dict[str, Any]:
 def is_replay_archived(replay_id: str, content_sha256: str | None = None) -> bool:
     """Indique si un replay (et optionnellement un hash) est déjà indexé."""
 
+    from pokecoach_trainer.archive_catalog import catalog_has_replay, initialize_catalog
+
+    root = get_settings().storage_root
+    initialize_catalog(root)
+    if catalog_has_replay(root, replay_id, content_sha256):
+        return True
     for row in _existing_versions(replay_id):
         if content_sha256 is None or row.get("content_sha256") == content_sha256:
             return True

@@ -8,7 +8,13 @@ from typing import Any, Callable
 
 import httpx
 
-from pokecoach_trainer.errors import InvalidConfiguration
+from pokecoach_trainer.collection_types import DiscoveryPage, SearchItem
+from pokecoach_trainer.errors import (
+    InvalidConfiguration,
+    ProviderInvalidPayload,
+    ProviderRateLimited,
+    ProviderUnavailable,
+)
 from pokecoach_trainer.schemas import SearchPage
 
 DEFAULT_SHOWDOWN_SITE = "https://replay.pokemonshowdown.com"
@@ -38,75 +44,102 @@ class ShowdownReplayClient:
         self._client = httpx.Client(
             transport=transport,
             timeout=httpx.Timeout(timeout_s),
-            follow_redirects=True,
+            follow_redirects=False,
         )
         self.request_count = 0
 
     def close(self) -> None:
         self._client.close()
 
-    def _request(self, method: str, url: str) -> httpx.Response:
-        last_exc: Exception | None = None
-        for attempt in range(1, self._max_attempts + 1):
-            self.request_count += 1
-            try:
-                response = self._client.request(method, url)
-            except httpx.RequestError as exc:
-                last_exc = exc
-                if attempt >= self._max_attempts:
-                    raise InvalidConfiguration(f"erreur réseau Showdown: {exc}") from exc
-                self._sleep(min(2.0 ** (attempt - 1), 8.0))
+    def _request_once(self, method: str, url: str) -> httpx.Response:
+        self.request_count += 1
+        try:
+            response = self._client.request(method, url)
+        except httpx.RequestError as exc:
+            raise ProviderUnavailable(f"erreur réseau Showdown: {exc}") from exc
+        if response.status_code in {301, 302, 307, 308}:
+            raise ProviderUnavailable("redirection Showdown inattendue")
+        if response.status_code == 429:
+            raise ProviderRateLimited(
+                "Showdown a renvoyé 429",
+                details={"retry_after": response.headers.get("Retry-After")},
+            )
+        if response.status_code in {404, 410}:
+            raise ProviderUnavailable(f"replay indisponible ({response.status_code})")
+        if response.status_code in {401, 403}:
+            raise InvalidConfiguration(f"accès Showdown refusé ({response.status_code})")
+        if response.status_code >= 500:
+            raise ProviderUnavailable(f"Showdown indisponible ({response.status_code})")
+        if response.status_code >= 400:
+            raise ProviderInvalidPayload(
+                f"requête Showdown refusée ({response.status_code})",
+                details={"url": url},
+            )
+        return response
+
+    def search_once(self, source_format: str, *, before: int) -> DiscoveryPage:
+        url = f"{self._site}/search.json?format={source_format}&before={before + 1}"
+        response = self._request_once("GET", url)
+        try:
+            items_raw = json.loads(response.text)
+        except json.JSONDecodeError as exc:
+            raise ProviderInvalidPayload("JSON de recherche invalide") from exc
+        if not isinstance(items_raw, list):
+            raise ProviderInvalidPayload("réponse de recherche inattendue")
+        if not items_raw:
+            return DiscoveryPage(items=tuple(), next_before=None, exhausted=True, blocked_reason=None)
+        page_items: list[SearchItem] = []
+        uploadtimes: list[int] = []
+        for item in items_raw:
+            if not isinstance(item, dict):
                 continue
-            if response.status_code == 429:
-                retry_after = float(response.headers.get("Retry-After", "1"))
-                self._sleep(retry_after)
-                if attempt >= self._max_attempts:
-                    raise InvalidConfiguration("Showdown a renvoyé 429 trop souvent")
+            replay_id = item.get("id")
+            uploadtime = item.get("uploadtime")
+            if not isinstance(replay_id, str) or not str(replay_id).startswith(source_format):
                 continue
-            if response.status_code >= 500:
-                if attempt >= self._max_attempts:
-                    raise InvalidConfiguration(
-                        f"Showdown indisponible ({response.status_code})"
-                    )
-                self._sleep(min(2.0 ** (attempt - 1), 8.0))
-                continue
-            if response.status_code >= 400:
-                raise InvalidConfiguration(
-                    f"requête Showdown refusée ({response.status_code})",
-                    details={"url": url},
-                )
-            return response
-        raise InvalidConfiguration("échec Showdown") from last_exc
+            ts = int(uploadtime)
+            uploadtimes.append(ts)
+            page_items.append(
+                SearchItem(replay_id=replay_id, uploadtime=ts, source_format=source_format)
+            )
+        oldest = min(uploadtimes) if uploadtimes else None
+        return DiscoveryPage(
+            items=tuple(page_items),
+            next_before=oldest,
+            exhausted=False,
+            blocked_reason=None,
+        )
+
+    def fetch_once(self, replay_id: str) -> dict[str, Any]:
+        url = f"{self._site}/{replay_id}.json"
+        response = self._request_once("GET", url)
+        try:
+            payload = json.loads(response.text)
+        except json.JSONDecodeError as exc:
+            raise ProviderInvalidPayload(
+                "JSON replay invalide",
+                details={"replay_id": replay_id},
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ProviderInvalidPayload("replay inattendu", details={"replay_id": replay_id})
+        if payload.get("id") != replay_id:
+            raise ProviderInvalidPayload(
+                "identifiant replay incohérent",
+                details={"requested": replay_id, "provider": payload.get("id")},
+            )
+        return payload
 
     def search(self, format_id: str, cursor: dict[str, Any] | None = None) -> SearchPage:
-        """
-        Interroge l'API de recherche (`before` décroissant).
-
-        Le curseur externe reprend la forme auditée VGC-Bench.
-        """
+        """Compatibilité : une page via `search_once`."""
 
         state = dict(cursor or {})
         before = int(state.get("before", 2_000_000_000))
-        url = f"{self._site}/search.json?format={format_id}&before={before + 1}"
-        response = self._request("GET", url)
-        try:
-            items = json.loads(response.text)
-        except json.JSONDecodeError as exc:
-            raise InvalidConfiguration("JSON de recherche invalide") from exc
-        if not isinstance(items, list):
-            raise InvalidConfiguration("réponse de recherche inattendue")
-        if not items:
-            return SearchPage(replay_ids=[], next_cursor=None, page_uploadtimes=[])
-        uploadtimes = [int(item.get("uploadtime", 0)) for item in items if isinstance(item, dict)]
-        oldest = int(items[-1]["uploadtime"])
-        replay_ids = [
-            str(item["id"])
-            for item in items
-            if isinstance(item, dict)
-            and isinstance(item.get("id"), str)
-            and str(item["id"]).startswith(format_id)
-        ]
-        next_cursor = {**state, "before": oldest, "format_id": format_id}
+        page = self.search_once(format_id, before=before)
+        replay_ids = [item.replay_id for item in page.items]
+        uploadtimes = [item.uploadtime for item in page.items]
+        next_cursor = None
+        if page.next_before is not None and not page.exhausted:
+            next_cursor = {**state, "before": page.next_before, "format_id": format_id}
         return SearchPage(
             replay_ids=replay_ids,
             next_cursor=next_cursor,
@@ -114,22 +147,7 @@ class ShowdownReplayClient:
         )
 
     def fetch(self, replay_id: str) -> dict[str, Any]:
-        """Télécharge la réponse JSON complète d'un replay."""
+        return self.fetch_once(replay_id)
 
-        url = f"{self._site}/{replay_id}.json"
-        response = self._request("GET", url)
-        try:
-            payload = json.loads(response.text)
-        except json.JSONDecodeError as exc:
-            raise InvalidConfiguration(
-                "JSON replay invalide",
-                details={"replay_id": replay_id},
-            ) from exc
-        if not isinstance(payload, dict):
-            raise InvalidConfiguration("replay inattendu", details={"replay_id": replay_id})
-        if payload.get("id") != replay_id:
-            raise InvalidConfiguration(
-                "identifiant replay incohérent",
-                details={"requested": replay_id, "provider": payload.get("id")},
-            )
-        return payload
+    def _request(self, method: str, url: str) -> httpx.Response:
+        return self._request_once(method, url)

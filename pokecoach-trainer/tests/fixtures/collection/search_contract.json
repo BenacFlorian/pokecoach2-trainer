@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "audited_at": "2026-11-04",
+  "source": "https://github.com/smogon/pokemon-showdown-client/blob/master/WEB-API.md#replay-search",
+  "format_id": "gen9championsvgc2026regmc",
+  "observations": {
+    "page_size_typical": 51,
+    "order": "uploadtime_desc",
+    "before_semantics": "exclusive_upper_bound",
+    "empty_response_means": "no_older_replays"
+  },
+  "continuation_rule": {
+    "first_before": "effective_upper_bound_plus_one",
+    "next_before": "oldest_uploadtime_on_page",
+    "stall_policy": "coverage_incomplete"
+  },
+  "sample_page_head": {
+    "uploadtime": 1793787367,
+    "id": "gen9championsvgc2026regmc-2709050685"
+  }
+}

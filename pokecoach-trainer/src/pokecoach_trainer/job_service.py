@@ -44,12 +44,50 @@ def read_job_logs(job_id: str, tail: int = 100) -> list[str]:
     log_path = storage_path("jobs", job_id, "worker.log")
     if not log_path.is_file():
         return []
-    lines = log_path.read_text(encoding="utf-8").splitlines()
+    max_bytes = 512 * 1024
+    with log_path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        read_size = min(size, max_bytes)
+        handle.seek(-read_size, 2)
+        data = handle.read(read_size)
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if read_size < size and lines:
+        lines = lines[1:]
+    return lines[-tail:]
+
+
+def read_collection_worker_logs(job_id: str, worker_id: str, tail: int = 100) -> list[str]:
+    """Dernières lignes du journal d'un worker de collecte (lecture bornée)."""
+
+    tail = max(1, min(tail, 1000))
+    log_path = storage_path("jobs", job_id, "workers", f"{worker_id}.log")
+    if not log_path.is_file():
+        return []
+    max_bytes = 512 * 1024
+    with log_path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        read_size = min(size, max_bytes)
+        handle.seek(-read_size, 2)
+        data = handle.read(read_size)
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if read_size < size and lines:
+        lines = lines[1:]
     return lines[-tail:]
 
 
 def submit_job(kind: JobKind, config: JobConfig | ExperimentConfig) -> JobRecord:
-    """Réserve le slot, persiste l'état `queued` et lance le worker."""
+    """Réserve le slot compute si besoin, persiste l'état `queued` et lance le worker."""
+
+    if kind == JobKind.collection:
+        from pokecoach_trainer.collection_service import submit_collection
+
+        if not isinstance(config, CollectionJobConfig):
+            raise ValueError("CollectionJobConfig requis")
+        return submit_collection(config.config)
 
     if kind == JobKind.training:
         from pokecoach_trainer.training_service import preflight

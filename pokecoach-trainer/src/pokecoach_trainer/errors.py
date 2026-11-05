@@ -37,3 +37,27 @@ class ContractMismatch(TrainerError):
 
 class BlockingMaskError(TrainerError):
     code = "blocking_mask_error"
+
+
+class StaleLease(TrainerError):
+    code = "stale_lease"
+
+
+class BudgetReached(TrainerError):
+    code = "budget_reached"
+
+
+class ProviderUnavailable(TrainerError):
+    code = "provider_unavailable"
+
+
+class ProviderRateLimited(TrainerError):
+    code = "provider_rate_limited"
+
+
+class ProviderInvalidPayload(TrainerError):
+    code = "provider_invalid_payload"
+
+
+class StorageIncompatible(TrainerError):
+    code = "storage_incompatible"

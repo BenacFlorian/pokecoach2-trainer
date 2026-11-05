@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,15 +22,42 @@ from pokecoach_trainer.schemas import (
     CollectionConfig,
     CollectionJobConfig,
     CollectionResult,
-    JobKind,
     JobRecord,
-    JobStatus,
 )
 from pokecoach_trainer.settings import storage_path
 from pokecoach_trainer.storage import write_json_atomic
 
 SleepFn = Callable[[float], None]
 ClockFn = Callable[[], float]
+
+
+def normalize_collection_config(config: CollectionConfig, *, now: datetime) -> CollectionConfig:
+    """Normalise formats/dates ; fige la borne haute technique au premier démarrage."""
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    formats = sorted(dict.fromkeys(config.format_ids))
+    effective_before = config.upload_before
+    if effective_before is None:
+        effective_before = now
+    return config.model_copy(
+        update={
+            "format_ids": formats,
+            "effective_upload_before": effective_before,
+        }
+    )
+
+
+def collection_request_fingerprint(config: CollectionConfig) -> str:
+    """Empreinte stable de la requête utilisateur (sans borne technique figée)."""
+
+    payload = config.model_dump(mode="json", exclude={"effective_upload_before"})
+    if config.upload_before is None:
+        payload["upload_before"] = None
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class CollectionJobLog:
@@ -156,14 +184,14 @@ def collect_replays(
         job_log.write(
             "collecte démarrée "
             f"logical={config.format_ids} showdown={source_formats} "
-            f"max_new_replays={config.max_new_replays} "
+            f"max_selected_replays={config.max_selected_replays} "
             f"max_requests={config.max_requests} max_duration_s={config.max_duration_s}"
         )
 
     def budgets_exceeded() -> str | None:
         elapsed = clock_fn() - started
-        if new_replays >= config.max_new_replays:
-            return "max_new_replays"
+        if new_replays >= config.max_selected_replays:
+            return "max_selected_replays"
         if http.request_count >= config.max_requests:
             return "max_requests"
         if elapsed >= config.max_duration_s:
@@ -219,7 +247,7 @@ def collect_replays(
                     )
                 persist_progress()
                 continue
-            sleep_fn(config.request_interval_s)
+            sleep_fn(config.legacy_request_interval_s)
             try:
                 payload = http.fetch(replay_id)
             except InvalidConfiguration as exc:
@@ -268,7 +296,7 @@ def collect_replays(
                         stop_reason = "budget_reached"
                         budget_limit = budget_limit or limit
                         break
-                    sleep_fn(config.request_interval_s)
+                    sleep_fn(config.legacy_request_interval_s)
                     page = http.search(source_format, cursor)
                     if not page.replay_ids and page.next_cursor is None:
                         break
@@ -347,52 +375,118 @@ def collect_replays(
     return result
 
 
-def run_collection_job(job_id: str) -> JobRecord:
-    """Exécute un job de collecte dans le worker."""
-
-    from pokecoach_trainer.jobs import release_training_lock
-
-    record = get_job(job_id)
-    if record.kind != JobKind.collection:
-        raise InvalidConfiguration("job incompatible avec la collecte")
-    record.status = JobStatus.running
-    save_job(record)
-    config = _config_from_job(record)
-    job_log = CollectionJobLog(job_id)
-    try:
-        result = collect_replays(config, job_id, job_log=job_log)
-        record.status = JobStatus.completed
-        record.finished_at = datetime.now(timezone.utc)
-        record.progress = result.model_dump(mode="json")
-        record.result_ref = json.dumps(
-            {"stop_reason": result.stop_reason, "new_replays": result.new_replays}
-        )
-        write_json_atomic(
-            storage_path("jobs", job_id, "collection_result.json"),
-            result.model_dump(mode="json"),
-        )
-        job_log.write(
-            f"job completed new_replays={result.new_replays} stop_reason={result.stop_reason}"
-        )
-    except Exception as exc:
-        record.status = JobStatus.failed
-        record.error = str(exc)
-        record.finished_at = datetime.now(timezone.utc)
-        import traceback
-
-        job_log.write(f"job failed: {exc}")
-        job_log.write(traceback.format_exc())
-        raise
-    finally:
-        release_training_lock(job_id)
-    save_job(record)
-    return record
-
-
 def submit_collection(config: CollectionConfig) -> JobRecord:
-    """Soumet un job de collecte via le mécanisme commun."""
+    """Démarre une campagne parallèle supervisée."""
 
-    from pokecoach_trainer.job_service import submit_job
+    from pokecoach_trainer.collection_store import CollectionStore
+    from pokecoach_trainer.collection_supervisor import ensure_supervisor
+    from pokecoach_trainer.settings import get_settings
 
-    payload = CollectionJobConfig(config=config)
-    return submit_job(JobKind.collection, payload)
+    root = get_settings().storage_root
+    store = CollectionStore(root)
+    view = store.start_campaign(config)
+    ensure_supervisor(root, view.job.job_id)
+    return view.job
+
+
+def get_collection(job_id: str):
+    from pokecoach_trainer.collection_store import CollectionStore
+    from pokecoach_trainer.errors import NotFound
+    from pokecoach_trainer.jobs import get_job
+    from pokecoach_trainer.schemas import JobKind
+    from pokecoach_trainer.settings import get_settings
+
+    store = CollectionStore(get_settings().storage_root)
+    try:
+        return store.get_campaign(job_id)
+    except NotFound:
+        try:
+            record = get_job(job_id)
+        except FileNotFoundError as exc:
+            raise NotFound(f"job {job_id} introuvable") from exc
+        if record.kind != JobKind.collection:
+            raise NotFound(f"campagne {job_id} introuvable")
+        raise NotFound(
+            "ancien job de collecte JSON ; sources éventuellement supprimées — "
+            "lancer une nouvelle collecte (non reprenable)",
+            details={"job_id": job_id, "legacy": True},
+        )
+
+
+def pause_collection(job_id: str):
+    from pokecoach_trainer.collection_store import CollectionStore
+    from pokecoach_trainer.settings import get_settings
+
+    store = CollectionStore(get_settings().storage_root)
+    return store.command(job_id, "pause")
+
+
+def stop_collection(job_id: str):
+    from pokecoach_trainer.collection_store import CollectionStore
+    from pokecoach_trainer.settings import get_settings
+
+    store = CollectionStore(get_settings().storage_root)
+    return store.command(job_id, "stop")
+
+
+def resume_collection(job_id: str, request):
+    from pokecoach_trainer.archive_catalog import catalog_connection
+    from pokecoach_trainer.collection_store import CollectionStore
+    from pokecoach_trainer.collection_supervisor import ensure_supervisor
+    from pokecoach_trainer.errors import InvalidConfiguration, NotFound
+    from pokecoach_trainer.jobs import get_job
+    from pokecoach_trainer.schemas import JobKind
+    from pokecoach_trainer.settings import get_settings
+
+    root = get_settings().storage_root
+    store = CollectionStore(root)
+    with catalog_connection(root) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM campaigns WHERE campaign_id = ?", (job_id,)
+        ).fetchone()
+    if row is None:
+        try:
+            record = get_job(job_id)
+        except FileNotFoundError as exc:
+            raise NotFound(f"job {job_id} introuvable") from exc
+        if record.kind == JobKind.collection:
+            raise InvalidConfiguration(
+                "ancien job non reprenable, lancer une nouvelle collecte",
+                details={"job_id": job_id},
+            )
+        raise NotFound(f"campagne {job_id} introuvable")
+    view = store.command(
+        job_id, "resume", new_budgets=getattr(request, "budgets", None)
+    )
+    ensure_supervisor(root, job_id)
+    return view
+
+
+def scale_collection(job_id: str, request):
+    from pokecoach_trainer.collection_store import CollectionStore
+    from pokecoach_trainer.settings import get_settings
+
+    store = CollectionStore(get_settings().storage_root)
+    return store.scale(
+        job_id,
+        discovery_workers=request.discovery_workers,
+        download_workers=request.download_workers,
+    )
+
+
+def retry_failed_collection(job_id: str, request):
+    from pokecoach_trainer.collection_store import CollectionStore
+    from pokecoach_trainer.settings import get_settings
+
+    store = CollectionStore(get_settings().storage_root)
+    return store.retry_failed(job_id, request)
+
+
+def run_collection_job(job_id: str) -> JobRecord:
+    """Compatibilité worker : redirige vers le superviseur."""
+
+    from pokecoach_trainer.collection_supervisor import ensure_supervisor
+    from pokecoach_trainer.settings import get_settings
+
+    ensure_supervisor(get_settings().storage_root, job_id)
+    return get_job(job_id)
