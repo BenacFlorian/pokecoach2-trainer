@@ -13,6 +13,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
@@ -39,6 +40,7 @@ from pokecoach_trainer.schemas import (
     InitializationConfig,
     ModelConfig,
     PrepareConfig,
+    PrepareExecutionConfig,
     SnapshotRequest,
     TrainingConfig,
 )
@@ -106,6 +108,47 @@ def _load_dataset_recipe(path: Path) -> DatasetRecipe:
     return DatasetRecipe.model_validate(block)
 
 
+def _load_prepare_execution_file(path: Path) -> PrepareExecutionConfig:
+    path = _resolve_user_path(path)
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    block = data.get("prepare", data)
+    return PrepareExecutionConfig.model_validate(block)
+
+
+def _resolve_prepare_execution(args: argparse.Namespace) -> PrepareExecutionConfig:
+    execution = PrepareExecutionConfig()
+    if getattr(args, "config", None):
+        execution = _load_prepare_execution_file(Path(args.config))
+    if getattr(args, "conversion_timeout_s", None) is not None:
+        execution = execution.model_copy(
+            update={"conversion_timeout_s": args.conversion_timeout_s}
+        )
+    workers_arg = getattr(args, "conversion_workers", None)
+    if workers_arg is not None:
+        if workers_arg == "auto":
+            workers: Literal["auto"] | int = "auto"
+        else:
+            workers = int(workers_arg)
+        execution = execution.model_copy(update={"conversion_workers": workers})
+    return execution
+
+
+def _cmd_dataset_resources(_args: argparse.Namespace) -> int:
+    from pokecoach_trainer.prepare_resources import detect_prepare_resources
+
+    resources = detect_prepare_resources()
+    payload = {
+        "logical_cpus": resources.logical_cpus,
+        "affinity_cpus": resources.affinity_cpus,
+        "process_cpus": resources.process_cpus,
+        "quota_cpus": resources.quota_cpus,
+        "available_workers": resources.available_workers,
+        "detection_notes": list(resources.detection_notes),
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
 def _cmd_dataset(args: argparse.Namespace) -> int:
     ensure_storage_layout()
     if args.dataset_cmd == "import":
@@ -116,6 +159,7 @@ def _cmd_dataset(args: argparse.Namespace) -> int:
         manifest = create_dataset(args.snapshot_id, recipe, dataset_id=args.dataset_id)
         print(manifest.model_dump_json(indent=2))
     elif args.dataset_cmd == "prepare":
+        execution = _resolve_prepare_execution(args)
         if args.sync_legacy:
             cfg = PrepareConfig(
                 seed=args.seed,
@@ -123,11 +167,17 @@ def _cmd_dataset(args: argparse.Namespace) -> int:
                 limit=args.limit,
                 strict=args.strict,
                 force=args.force,
+                conversion_workers=execution.conversion_workers,
+                conversion_timeout_s=execution.conversion_timeout_s,
             )
-            manifest = prepare_dataset(args.dataset_id, cfg)
+            manifest = prepare_dataset(
+                args.dataset_id,
+                cfg,
+                execution=execution,
+            )
             print(manifest.model_dump_json(indent=2))
         else:
-            record = submit_preparation(args.dataset_id)
+            record = submit_preparation(args.dataset_id, execution=execution)
             print(record.model_dump_json(indent=2))
     elif args.dataset_cmd == "inspect":
         payload = inspect_decision(
@@ -139,6 +189,8 @@ def _cmd_dataset(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
     elif args.dataset_cmd == "show":
         print(get_dataset(args.dataset_id).model_dump_json(indent=2))
+    elif args.dataset_cmd == "resources":
+        return _cmd_dataset_resources(args)
     return 0
 
 
@@ -444,6 +496,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="refaire un prepare même si le dataset est déjà prêt",
     )
+    prep.add_argument(
+        "--config",
+        default=None,
+        help="YAML prepare (bloc prepare: conversion_workers, conversion_timeout_s)",
+    )
+    prep.add_argument(
+        "--conversion-workers",
+        default=None,
+        help="nombre de workers ou auto (prioritaire sur --config)",
+    )
+    prep.add_argument(
+        "--conversion-timeout-s",
+        type=float,
+        default=None,
+        help="timeout par perspective en secondes (prioritaire sur --config)",
+    )
     ins = ds_sub.add_parser("inspect")
     ins.add_argument("--dataset-id", required=True)
     ins.add_argument("--index", type=int, default=0)
@@ -451,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     ins.add_argument("--player-side", default=None)
     show = ds_sub.add_parser("show")
     show.add_argument("--dataset-id", required=True)
+    ds_sub.add_parser("resources", help="CPU/cgroup disponibles pour prepare")
 
     train = sub.add_parser("train")
     train.add_argument("--config", required=True)

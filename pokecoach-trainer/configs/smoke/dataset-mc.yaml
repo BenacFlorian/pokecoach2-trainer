@@ -1,7 +1,8 @@
+# Smoke prepare : filtres assouplis pour valider le pipeline (≠ recette prod M-C).
 dataset:
   variant: natural
   regulation: M-C
-  target_replays: 20
+  target_replays: 100
   seed: 42
   min_elo: 1100
   max_elo: null
@@ -12,8 +13,8 @@ dataset:
   include_bo1: true
   include_bo3: true
   include_forfeits: true
-  min_completed_turns_forfeit: 3
-  exclude_inactivity_losses: true
+  min_completed_turns_forfeit: 2
+  exclude_inactivity_losses: false
   deduplicate: true
   max_replays_per_team: null
   splits:

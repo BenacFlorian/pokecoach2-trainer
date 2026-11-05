@@ -14,10 +14,12 @@ from pokecoach_trainer.schemas import (
     ConversionStatus,
     DatasetRecipe,
     DatasetState,
+    PrepareExecutionConfig,
     SnapshotRequest,
 )
 from pokecoach_trainer.settings import clear_settings_cache, ensure_storage_layout, storage_path
 from replay_log_fixtures import build_log
+from prepare_process_helpers import fake_converted_iter, fake_conversion_pool
 
 
 @pytest.fixture
@@ -64,18 +66,21 @@ def test_ready_dataset_immutable(ds_env):
     )
     recipe = DatasetRecipe(target_replays=3)
     manifest = create_dataset(snap_id, recipe, dataset_id="ds-immutable")
-    with patch("pokecoach_trainer.conversion.convert_perspectives_parallel") as mock_conv:
-        mock_conv.side_effect = lambda tasks, executor, contract=None: [
-            ConversionResult(
-                replay_id=ref.replay_id,
-                raw_sha256=ref.content_sha256,
-                player_side=side,
-                status=ConversionStatus.converted,
-                trajectory=_fake_traj(),
-            )
-            for ref, side in tasks
-        ]
-        ready = prepare_dataset("ds-immutable", job_id="job-test")
+    with (
+        patch(
+            "pokecoach_trainer.conversion_runtime.conversion_pool",
+            fake_conversion_pool,
+        ),
+        patch(
+            "pokecoach_trainer.conversion.iter_converted_perspectives",
+            fake_converted_iter,
+        ),
+    ):
+        ready = prepare_dataset(
+            "ds-immutable",
+            job_id="job-test",
+            execution=PrepareExecutionConfig(conversion_workers=1),
+        )
     assert ready.state == DatasetState.ready
     with pytest.raises(FileExistsError):
         create_dataset(snap_id, recipe, dataset_id="ds-immutable")
@@ -96,25 +101,21 @@ def test_splits_disjoint_on_disk(ds_env):
     recipe = DatasetRecipe(target_replays=3)
     create_dataset(snap_id, recipe, dataset_id="ds-splits")
 
-    def fake_convert(tasks, executor, contract=None):
-        out = []
-        for ref, side in tasks:
-            out.append(
-                ConversionResult(
-                    replay_id=ref.replay_id,
-                    raw_sha256=ref.content_sha256,
-                    player_side=side,
-                    status=ConversionStatus.converted,
-                    trajectory=_fake_traj(),
-                )
-            )
-        return out
-
-    with patch(
-        "pokecoach_trainer.conversion.convert_perspectives_parallel",
-        side_effect=fake_convert,
+    with (
+        patch(
+            "pokecoach_trainer.conversion_runtime.conversion_pool",
+            fake_conversion_pool,
+        ),
+        patch(
+            "pokecoach_trainer.conversion.iter_converted_perspectives",
+            fake_converted_iter,
+        ),
     ):
-        manifest = prepare_dataset("ds-splits", job_id="job-splits")
+        manifest = prepare_dataset(
+            "ds-splits",
+            job_id="job-splits",
+            execution=PrepareExecutionConfig(conversion_workers=2),
+        )
     assert manifest.state == DatasetState.ready
     train = set(manifest.replay_ids_train)
     val = set(manifest.replay_ids_val)

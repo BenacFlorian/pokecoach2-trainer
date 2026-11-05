@@ -21,6 +21,7 @@ from pokecoach_trainer.schemas import (
     JobRecord,
     LegacyImportDatasetSource,
     PrepareConfig,
+    PrepareExecutionConfig,
     SnapshotDatasetSource,
 )
 from pokecoach_trainer.settings import ensure_storage_layout, storage_path
@@ -294,6 +295,7 @@ def prepare_dataset(
     config: PrepareConfig | None = None,
     *,
     job_id: str | None = None,
+    execution: PrepareExecutionConfig | None = None,
 ) -> DatasetManifest:
     """
     Prépare un dataset legacy (import JSON) ou snapshot (worker).
@@ -305,20 +307,31 @@ def prepare_dataset(
     if manifest_path.is_file():
         existing = DatasetManifest.model_validate(read_json(manifest_path))
         if existing.state in {DatasetState.created, DatasetState.preparing} and config is None:
-            return _prepare_snapshot_dataset(dataset_id, job_id=job_id)
+            exec_cfg = execution or PrepareExecutionConfig()
+            return _prepare_snapshot_dataset(dataset_id, job_id=job_id, execution=exec_cfg)
         if existing.state == DatasetState.imported and config is not None:
-            return _prepare_legacy_raw_logs(dataset_id, config)
+            return _prepare_legacy_raw_logs(
+                dataset_id, config, execution=config.execution()
+            )
         if existing.state == DatasetState.ready and config is not None and not config.force:
             raise FileExistsError(
                 "dataset déjà prêt ; ne pas écraser (ajouter --force pour refaire)"
             )
     if config is not None:
-        return _prepare_legacy_raw_logs(dataset_id, config)
+        exec_cfg = execution or config.execution()
+        return _prepare_legacy_raw_logs(dataset_id, config, execution=exec_cfg)
     raise ValueError("configuration PrepareConfig requise pour import legacy")
 
 
-def _prepare_legacy_raw_logs(dataset_id: str, config: PrepareConfig) -> DatasetManifest:
+def _prepare_legacy_raw_logs(
+    dataset_id: str,
+    config: PrepareConfig,
+    *,
+    execution: PrepareExecutionConfig | None = None,
+) -> DatasetManifest:
     """Chemin historique raw_logs → train/validation (compatibilité palier 1)."""
+
+    _ = execution  # consommé par les tâches parallèles ultérieures
 
     validate_id(dataset_id)
     manifest_path = _manifest_path(dataset_id)
@@ -405,12 +418,16 @@ def _prepare_legacy_raw_logs(dataset_id: str, config: PrepareConfig) -> DatasetM
     return manifest
 
 
-def _prepare_snapshot_dataset(dataset_id: str, *, job_id: str | None) -> DatasetManifest:
+def _prepare_snapshot_dataset(
+    dataset_id: str,
+    *,
+    job_id: str | None,
+    execution: PrepareExecutionConfig,
+) -> DatasetManifest:
     """Builder snapshot : filtres, sélection, conversion, splits et publication."""
 
     from pokecoach_trainer.archive_service import read_snapshot
     from pokecoach_trainer.compatibility import build_contract
-    from pokecoach_trainer.conversion import convert_perspectives_parallel
     from pokecoach_trainer.dataset_filters import decide_game, decide_perspective
     from pokecoach_trainer.dataset_split import assign_splits, build_replay_groups, select_groups
     from pokecoach_trainer.errors import BlockingMaskError
@@ -550,7 +567,41 @@ def _prepare_snapshot_dataset(dataset_id: str, *, job_id: str | None) -> Dataset
         f"(train={len(assignments.train)} val={len(assignments.validation)} "
         f"test={len(assignments.test)}) conversion={len(tasks)} perspectives"
     )
-    from vgc_bench.logs2trajs import _init_worker_loop
+    from pokecoach_trainer.conversion import (
+        ConversionInfrastructureError,
+        iter_converted_perspectives,
+    )
+    from pokecoach_trainer.conversion_runtime import conversion_pool
+    from pokecoach_trainer.prepare_resources import (
+        detect_prepare_resources,
+        resolve_conversion_workers,
+    )
+    from pokecoach_trainer.settings import get_settings
+
+    resources = detect_prepare_resources()
+    effective_workers = resolve_conversion_workers(
+        execution.conversion_workers,
+        resources,
+        task_count=len(tasks),
+    )
+    settings = get_settings()
+    prepare_execution = {
+        "requested_workers": execution.conversion_workers,
+        "effective_workers": effective_workers,
+        "conversion_timeout_s": execution.conversion_timeout_s,
+        "resources": {
+            "logical_cpus": resources.logical_cpus,
+            "affinity_cpus": resources.affinity_cpus,
+            "process_cpus": resources.process_cpus,
+            "quota_cpus": resources.quota_cpus,
+            "available_workers": resources.available_workers,
+            "detection_notes": list(resources.detection_notes),
+        },
+    }
+    log.write(
+        f"prepare workers demandé={execution.conversion_workers!r} "
+        f"effectif={effective_workers} perspectives={len(tasks)}"
+    )
 
     traj_index: list[dict] = []
     split_dirs = {
@@ -565,64 +616,85 @@ def _prepare_snapshot_dataset(dataset_id: str, *, job_id: str | None) -> Dataset
         replay_to_split[rid] = "validation"
     for rid in assignments.test:
         replay_to_split[rid] = "test"
-
-    try:
-        with ProcessPoolExecutor(max_workers=1, initializer=_init_worker_loop) as executor:
-            log.write(f"prepare conversion démarrée ({len(tasks)} perspectives)")
-            results = convert_perspectives_parallel(tasks, executor, contract=contract)
-    finally:
-        pass
-
-    converted_n = sum(1 for r in results if r.status == ConversionStatus.converted)
-    rejected_n = sum(1 for r in results if r.status == ConversionStatus.rejected)
-    error_n = sum(1 for r in results if r.status == ConversionStatus.error)
-    log.write(
-        f"prepare conversion terminée converted={converted_n} "
-        f"rejected={rejected_n} errors={error_n}"
-    )
     train_files: list[Path] = []
     val_files: list[Path] = []
     test_files: list[Path] = []
 
-    for result in results:
-        if result.status == ConversionStatus.error and result.reason_code in {
-            "blocking_mask_first_target",
-            "blocking_mask_second_target",
-            "action_index_out_of_bounds",
-            "blocking_mask_error",
-        }:
-            blocking_error = BlockingMaskError(
-                result.reason_code or "blocking_mask_error",
-                details=result.details,
+    converted_n = 0
+    rejected_n = 0
+    error_n = 0
+    transitions_train = 0
+    transitions_val = 0
+    transitions_test = 0
+
+    try:
+        with conversion_pool(
+            workers=effective_workers,
+            storage_root=settings.storage_root,
+            vendor_root=settings.vgc_bench_root,
+            timeout_s=execution.conversion_timeout_s,
+        ) as executor:
+            if executor is None:
+                raise ValueError("aucun worker de conversion disponible")
+            log.write(f"prepare conversion démarrée ({len(tasks)} perspectives)")
+            result_iter = iter_converted_perspectives(
+                tasks,
+                executor,
+                contract=contract,
+                seed=recipe.seed,
+                max_in_flight=max(2, 2 * effective_workers),
             )
-            break
-        if result.status != ConversionStatus.converted or result.trajectory is None:
-            continue
-        split_name = replay_to_split.get(result.replay_id)
-        if not split_name:
-            continue
-        out = split_dirs[split_name] / f"{result.replay_id}_{result.player_side}.pkl"
-        with out.open("wb") as handle:
-            pickle.dump(result.trajectory, handle)
-        digest = sha256_file(out)
-        traj_index.append(
-            {
-                "replay_id": result.replay_id,
-                "player_side": result.player_side,
-                "raw_sha256": result.raw_sha256,
-                "split": split_name,
-                "file": out.name,
-                "file_sha256": digest,
-                "transitions": len(result.trajectory.acts),
-                "converter_revision": result.converter_revision,
-            }
-        )
-        if split_name == "train":
-            train_files.append(out)
-        elif split_name == "validation":
-            val_files.append(out)
-        else:
-            test_files.append(out)
+            for result in result_iter:
+                if result.status == ConversionStatus.converted:
+                    converted_n += 1
+                elif result.status == ConversionStatus.rejected:
+                    rejected_n += 1
+                elif result.status == ConversionStatus.error:
+                    error_n += 1
+                if result.status != ConversionStatus.converted or result.trajectory is None:
+                    continue
+                split_name = replay_to_split.get(result.replay_id)
+                if not split_name:
+                    continue
+                out = split_dirs[split_name] / f"{result.replay_id}_{result.player_side}.pkl"
+                n_trans = len(result.trajectory.acts)
+                with out.open("wb") as handle:
+                    pickle.dump(result.trajectory, handle)
+                digest = sha256_file(out)
+                traj_index.append(
+                    {
+                        "replay_id": result.replay_id,
+                        "player_side": result.player_side,
+                        "raw_sha256": result.raw_sha256,
+                        "split": split_name,
+                        "file": out.name,
+                        "file_sha256": digest,
+                        "transitions": n_trans,
+                        "converter_revision": result.converter_revision,
+                    }
+                )
+                if split_name == "train":
+                    train_files.append(out)
+                    transitions_train += n_trans
+                elif split_name == "validation":
+                    val_files.append(out)
+                    transitions_val += n_trans
+                else:
+                    test_files.append(out)
+                    transitions_test += n_trans
+    except BlockingMaskError as exc:
+        blocking_error = exc
+    except ConversionInfrastructureError as exc:
+        blocking_error = BlockingMaskError(exc.reason_code, details=exc.details)
+    except KeyboardInterrupt:
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+        raise
+
+    log.write(
+        f"prepare conversion terminée converted={converted_n} "
+        f"rejected={rejected_n} errors={error_n}"
+    )
 
     if blocking_error:
         log.write(f"prepare échec blocking: {blocking_error.message}")
@@ -634,6 +706,10 @@ def _prepare_snapshot_dataset(dataset_id: str, *, job_id: str | None) -> Dataset
         raise blocking_error
 
     write_json_atomic(staging_root / "split_assignments.json", assignments.model_dump(mode="json"))
+    traj_index.sort(
+        key=lambda row: (row["replay_id"], row["raw_sha256"], row["player_side"])
+    )
+    write_json_atomic(staging_root / "prepare_execution.json", prepare_execution)
     index_path = staging_root / "trajectory_index.jsonl"
     for row in traj_index:
         append_jsonl_atomic(index_path, row)
@@ -653,15 +729,16 @@ def _prepare_snapshot_dataset(dataset_id: str, *, job_id: str | None) -> Dataset
         trajectories_train=len(train_files),
         trajectories_val=len(val_files),
         trajectories_test=len(test_files),
-        transitions_train=count_transitions(train_files) if train_files else 0,
-        transitions_val=count_transitions(val_files) if val_files else 0,
-        transitions_test=count_transitions(test_files) if test_files else 0,
+        transitions_train=transitions_train,
+        transitions_val=transitions_val,
+        transitions_test=transitions_test,
         selected_replays=selected_count,
         target_replays=recipe.target_replays,
         overshoot_replays=overshoot,
         split_id=assignments.split_id,
         series_leakage_guarantee=assignments.series_leakage_guarantee,
         ungrouped_bo3_count=assignments.ungrouped_bo3_count,
+        prepare_execution=prepare_execution,
     )
     write_json_atomic(staging_root / "manifest.json", manifest.model_dump(mode="json"))
     _promote_staging_extended(staging_root, out_root, manifest_path)
@@ -693,7 +770,7 @@ def _promote_staging_extended(staging_root: Path, out_root: Path, manifest_path:
             shutil.rmtree(dest)
         if src.exists() and any(src.iterdir()):
             shutil.move(str(src), str(dest))
-    for name in ("split_assignments.json", "trajectory_index.jsonl"):
+    for name in ("split_assignments.json", "trajectory_index.jsonl", "prepare_execution.json"):
         src = staging_root / name
         if src.is_file():
             shutil.move(str(src), str(out_root / name))
@@ -702,7 +779,10 @@ def _promote_staging_extended(staging_root: Path, out_root: Path, manifest_path:
         shutil.move(str(staged_manifest), str(manifest_path))
 
 
-def submit_preparation(dataset_id: str) -> JobRecord:
+def submit_preparation(
+    dataset_id: str,
+    execution: PrepareExecutionConfig | None = None,
+) -> JobRecord:
     """Soumet un job prepare pour un dataset snapshot ou legacy import."""
 
     from pokecoach_trainer.job_service import submit_job
@@ -731,10 +811,12 @@ def submit_preparation(dataset_id: str) -> JobRecord:
             raise ValueError("snapshot_id manquant")
         dataset_source = SnapshotDatasetSource(snapshot_id=manifest.snapshot_id)
 
+    exec_cfg = execution or PrepareExecutionConfig()
     payload = DatasetJobConfig(
         dataset_id=dataset_id,
         dataset_source=dataset_source,
         recipe=manifest.recipe,
+        execution=exec_cfg,
     )
     record = submit_job(JobKind.prepare, payload)
     manifest.state = DatasetState.preparing
@@ -826,7 +908,8 @@ def run_prepare_job(job_id: str) -> None:
             manifest.snapshot_id = snapshot.snapshot_id
             manifest.snapshot_sha256 = snapshot.snapshot_sha256
             write_json_atomic(_manifest_path(dataset_id), manifest.model_dump(mode="json"))
-        prepare_dataset(dataset_id, job_id=job_id)
+        exec_cfg = cfg.execution
+        prepare_dataset(dataset_id, job_id=job_id, execution=exec_cfg)
         record.status = JobStatus.completed
         record.finished_at = datetime.now(timezone.utc)
         refreshed = get_dataset(dataset_id)

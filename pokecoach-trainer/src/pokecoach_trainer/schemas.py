@@ -8,7 +8,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 _SHOWDOWN_SPECIES_ID = re.compile(r"^[a-z0-9]+$")
 
@@ -91,6 +99,54 @@ class TrainingConfig(BaseModel):
         return v
 
 
+def _validate_conversion_workers(value: object) -> Literal["auto"] | int:
+    if isinstance(value, bool):
+        raise ValueError("conversion_workers ne accepte pas les booléens")
+    if value == "auto":
+        return "auto"
+    if isinstance(value, str):
+        raise ValueError("conversion_workers doit être 'auto' ou un entier >= 1")
+    if isinstance(value, int) and value >= 1:
+        return value
+    raise ValueError("conversion_workers doit être 'auto' ou un entier >= 1")
+
+
+def _validate_conversion_timeout_s(value: float) -> float:
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("conversion_timeout_s doit être fini et > 0")
+    return value
+
+
+class PrepareExecutionConfig(BaseModel):
+    """Paramètres d'exécution prepare (parallélisme, timeouts) — hors recette dataset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversion_workers: Literal["auto"] | StrictInt = "auto"
+    conversion_timeout_s: float = 120.0
+
+    @field_validator("conversion_workers", mode="before")
+    @classmethod
+    def _coerce_workers(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("conversion_workers ne accepte pas les booléens")
+        if isinstance(value, str) and value.isdigit():
+            raise ValueError(
+                "conversion_workers: chaîne numérique interdite dans YAML/JSON ; utiliser un entier"
+            )
+        return value
+
+    @field_validator("conversion_workers")
+    @classmethod
+    def _workers(cls, value: object) -> Literal["auto"] | int:
+        return _validate_conversion_workers(value)
+
+    @field_validator("conversion_timeout_s")
+    @classmethod
+    def _timeout(cls, value: float) -> float:
+        return _validate_conversion_timeout_s(value)
+
+
 class PrepareConfig(BaseModel):
     seed: int = 42
     validation_ratio: float = 0.10
@@ -99,6 +155,35 @@ class PrepareConfig(BaseModel):
     only_winner: bool = False
     strict: bool = False
     force: bool = False
+    conversion_workers: Literal["auto"] | StrictInt = "auto"
+    conversion_timeout_s: float = 120.0
+
+    @field_validator("conversion_workers", mode="before")
+    @classmethod
+    def _coerce_workers(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("conversion_workers ne accepte pas les booléens")
+        if isinstance(value, str) and value.isdigit():
+            raise ValueError(
+                "conversion_workers: chaîne numérique interdite dans YAML/JSON ; utiliser un entier"
+            )
+        return value
+
+    @field_validator("conversion_workers")
+    @classmethod
+    def _workers(cls, value: object) -> Literal["auto"] | int:
+        return _validate_conversion_workers(value)
+
+    @field_validator("conversion_timeout_s")
+    @classmethod
+    def _timeout(cls, value: float) -> float:
+        return _validate_conversion_timeout_s(value)
+
+    def execution(self) -> PrepareExecutionConfig:
+        return PrepareExecutionConfig(
+            conversion_workers=self.conversion_workers,
+            conversion_timeout_s=self.conversion_timeout_s,
+        )
 
 
 class SplitRatios(BaseModel):
@@ -692,6 +777,7 @@ class DatasetManifest(BaseModel):
     encoding_contract_fingerprint: str | None = None
     rejected: list[dict[str, Any]] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    prepare_execution: dict[str, Any] | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -795,6 +881,7 @@ class DatasetJobConfig(BaseModel):
     dataset_id: str
     dataset_source: DatasetSource
     recipe: DatasetRecipe | None = None
+    execution: PrepareExecutionConfig = Field(default_factory=PrepareExecutionConfig)
 
 
 class TrainingJobConfig(BaseModel):

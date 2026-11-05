@@ -23,6 +23,7 @@ from pokecoach_trainer.schemas import (
     JobKind,
     LegacyImportDatasetRequest,
     PrepareConfig,
+    PrepareExecutionConfig,
 )
 
 router = APIRouter()
@@ -59,7 +60,7 @@ def api_import_legacy(body: LegacyImportDatasetRequest):
             body.recipe,
             dataset_id=body.dataset_id,
         )
-        job = submit_preparation(manifest.dataset_id)
+        job = submit_preparation(manifest.dataset_id, execution=PrepareExecutionConfig())
         return {"dataset": manifest, "job": job}
     except Conflict as exc:
         raise _trainer_http(exc) from exc
@@ -79,7 +80,10 @@ def api_import(body: dict):
 
 
 @router.post("/{dataset_id}/prepare", status_code=202)
-def api_prepare(dataset_id: str, body: PrepareConfig | None = None):
+def api_prepare(
+    dataset_id: str,
+    body: PrepareExecutionConfig | PrepareConfig | None = None,
+):
     manifest_path_exists = True
     try:
         existing = get_dataset(dataset_id)
@@ -88,9 +92,14 @@ def api_prepare(dataset_id: str, body: PrepareConfig | None = None):
         existing = None
 
     if existing and existing.state == DatasetState.imported:
-        body = body or PrepareConfig()
+        if isinstance(body, PrepareExecutionConfig):
+            raise HTTPException(
+                status_code=422,
+                detail="corps PrepareExecutionConfig incompatible avec import legacy",
+            )
+        legacy_body = body if isinstance(body, PrepareConfig) else PrepareConfig()
         try:
-            return prepare_dataset(dataset_id, body)
+            return prepare_dataset(dataset_id, legacy_body)
         except FileExistsError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
@@ -98,8 +107,18 @@ def api_prepare(dataset_id: str, body: PrepareConfig | None = None):
 
     if not manifest_path_exists:
         raise HTTPException(status_code=404, detail="dataset introuvable")
+    if isinstance(body, PrepareConfig):
+        raise HTTPException(
+            status_code=422,
+            detail="corps PrepareConfig incompatible avec snapshot ; utiliser conversion_workers",
+        )
+    execution = (
+        body
+        if isinstance(body, PrepareExecutionConfig)
+        else PrepareExecutionConfig()
+    )
     try:
-        job = submit_preparation(dataset_id)
+        job = submit_preparation(dataset_id, execution=execution)
         return {"dataset_id": dataset_id, "job": job}
     except Conflict as exc:
         raise _trainer_http(exc) from exc

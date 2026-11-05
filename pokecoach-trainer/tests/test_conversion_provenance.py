@@ -6,7 +6,7 @@ from imitation.data.types import Trajectory
 from vgc_bench.src.utils import chunk_obs_len
 
 from pokecoach_trainer.conversion import convert_perspectives_parallel
-from pokecoach_trainer.schemas import ArchiveRef, ConversionStatus
+from pokecoach_trainer.schemas import ArchiveRef, ConversionResult, ConversionStatus
 from vgc_bench.logs2trajs import process_logs_with_provenance
 
 
@@ -55,19 +55,21 @@ def test_convert_perspectives_parallel_keeps_task_order(monkeypatch):
     )
 
     class FakeExecutor:
-        def submit(self, *_args, **_kwargs):
+        _max_workers = 2
+
+        def submit(self, _fn, ref, side, _contract, _seed):
             fut: Future = Future()
-            fut.set_result(None)
+            fut.set_result(
+                ConversionResult(
+                    replay_id=ref.replay_id,
+                    raw_sha256=ref.content_sha256,
+                    player_side=side,  # type: ignore[arg-type]
+                    status=ConversionStatus.rejected,
+                    reason_code="conversion_empty",
+                )
+            )
             return fut
 
-    monkeypatch.setattr(
-        "pokecoach_trainer.conversion.read_archived_object",
-        lambda _rid, _sha: {"provider": {"log": "|win|x\n"}},
-    )
-    monkeypatch.setattr(
-        "pokecoach_trainer.conversion.build_contract",
-        lambda *_a, **_k: type("C", (), {"fingerprint": "fp", "act_len": 107})(),
-    )
     results = convert_perspectives_parallel(
         [(ref_b, "p2"), (ref_a, "p1")],
         FakeExecutor(),
