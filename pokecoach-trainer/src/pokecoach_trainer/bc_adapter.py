@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,6 +14,7 @@ from stable_baselines3.common.utils import ConstantSchedule
 from torch.utils import data as th_data
 
 from pokecoach_trainer.schemas import EvaluationResult
+from pokecoach_trainer.training_data import TransitionBatch
 from pokecoach_trainer.trajectory_dataset import _obs_arrays
 
 
@@ -21,6 +24,28 @@ class BCTrainStats:
 
     optimizer_steps: int = 0
     transitions_seen: int = 0
+
+
+class _TransitionBatchIterable:
+    """Enveloppe un flux de batches pour `BC.train()` et compte les transitions."""
+
+    def __init__(
+        self,
+        batches: Iterable[TransitionBatch],
+        stats: BCTrainStats,
+    ) -> None:
+        self._batches = batches
+        self._stats = stats
+
+    def __iter__(self):
+        for batch in self._batches:
+            acts = batch["acts"]
+            n = int(acts.shape[0])
+            obs = batch["obs"]
+            if len(obs) != n:
+                raise ValueError("taille obs/acts incohérente")
+            self._stats.transitions_seen += n
+            yield batch
 
 
 class CompleteBatchBC(BC):
@@ -34,6 +59,10 @@ class CompleteBatchBC(BC):
         super().__init__(*args, **kwargs)
         self._last_train_stats = BCTrainStats()
         self._wrap_optimizer_step()
+        self._streaming_batches = False
+        self._expected_transitions: int | None = None
+        self._cached_trajectories: list | None = None
+        self._batch_source: Iterable[TransitionBatch] | None = None
 
     def _wrap_optimizer_step(self) -> None:
         original = self.optimizer.step
@@ -50,6 +79,10 @@ class CompleteBatchBC(BC):
 
     def set_demonstrations(self, demonstrations) -> None:
         """Prépare un DataLoader sans `drop_last` ni wrapper à taille fixe."""
+
+        self._streaming_batches = False
+        self._expected_transitions = None
+        self._batch_source = None
 
         trajectories = list(demonstrations)
         transitions = rollout.flatten_trajectories(trajectories)
@@ -73,10 +106,66 @@ class CompleteBatchBC(BC):
         )
         self._demo_data_loader = loader
 
+    def set_transition_batches(
+        self,
+        batches: Iterable[TransitionBatch],
+        *,
+        expected_transitions: int,
+        batch_size: int,
+    ) -> None:
+        """Installe un flux de batches (sans aplatir les trajectoires)."""
+
+        if expected_transitions < 1 or batch_size < 1:
+            raise ValueError("comptes batch invalides")
+        effective = min(batch_size, expected_transitions)
+        effective = max(effective, 1)
+        self.batch_size = effective
+        self.minibatch_size = effective
+        self._streaming_batches = True
+        self._expected_transitions = expected_transitions
+        self._cached_trajectories = None
+        self._batch_source = batches
+
     def train(self, *args, **kwargs):
+        n_epochs = kwargs.get("n_epochs")
+        n_batches = kwargs.get("n_batches")
+        streaming = self._streaming_batches
+        if streaming:
+            if n_batches is not None:
+                raise ValueError("n_batches non supporté en mode flux")
+            if n_epochs is not None and n_epochs != 1:
+                raise ValueError("n_epochs doit valoir 1 en mode flux")
+
         self._last_train_stats = BCTrainStats()
+        if streaming:
+            if self._batch_source is None:
+                raise RuntimeError("flux sans source de batches")
+            self._demo_data_loader = _TransitionBatchIterable(
+                self._batch_source,
+                self._last_train_stats,
+            )
+
         result = super().train(*args, **kwargs)
-        cached = getattr(self, "_cached_trajectories", None)
+
+        if streaming:
+            expected = self._expected_transitions
+            if expected is None:
+                raise RuntimeError("mode flux sans expected_transitions")
+            seen = self._last_train_stats.transitions_seen
+            if seen != expected:
+                raise ValueError(
+                    f"transitions observées {seen} != attendues {expected}",
+                )
+            eff = self.batch_size
+            expected_steps = max(1, math.ceil(expected / eff))
+            steps = self._last_train_stats.optimizer_steps
+            if steps != expected_steps:
+                raise ValueError(
+                    f"pas observés {steps} != attendus {expected_steps}",
+                )
+            return result
+
+        cached = self._cached_trajectories
         if cached is not None:
             self._last_train_stats.transitions_seen = sum(len(t.acts) for t in cached)
         return result
@@ -84,6 +173,8 @@ class CompleteBatchBC(BC):
     def remember_trajectories(self, trajectories) -> None:
         """Mémorise les trajectoires pour le décompte des transitions consommées."""
 
+        if self._streaming_batches:
+            return
         self._cached_trajectories = list(trajectories)
 
     @property
@@ -117,40 +208,23 @@ def evaluate_nll(
     policy,
     demonstrations,
     device: str,
+    *,
+    batch_size: int = 256,
 ) -> EvaluationResult:
     """
     NLL moyenne (-log π(a|s)) sur une copie isolée, sans modifier la policy d'origine.
     """
 
+    from pokecoach_trainer.training_data import iter_transition_batches
+
     demos = list(demonstrations)
     if not demos:
         raise ValueError("évaluation sans transitions")
 
-    clone = duplicate_policy(policy, device)
-    clone.eval()
-    clone.actor_grad = False
-    for param in clone.parameters():
-        param.requires_grad = False
+    batches = iter_transition_batches(demos, batch_size=batch_size)
+    from pokecoach_trainer.bc_evaluation import evaluate_nll_batches
 
-    losses: list[float] = []
-    transitions = 0
-    with torch.no_grad():
-        for traj in demos:
-            obs = _obs_arrays(traj.obs)
-            acts = torch.as_tensor(traj.acts, device=device)
-            obs_t = {k: torch.as_tensor(v, device=device) for k, v in obs.items()}
-            for step in range(acts.shape[0]):
-                step_obs = {k: obs_t[k][step : step + 1] for k in obs_t}
-                step_act = acts[step : step + 1]
-                _, log_prob, _ = clone.evaluate_actions(step_obs, step_act)
-                lp = float(log_prob.mean().detach().cpu())
-                loss = -lp
-                if not np.isfinite(loss):
-                    raise ValueError("NLL non finie")
-                losses.append(loss)
-                transitions += 1
-    del clone
-    return EvaluationResult(nll=float(np.mean(losses)), transitions=transitions)
+    return evaluate_nll_batches(policy, batches, device)
 
 
 def count_transitions(demonstrations) -> int:

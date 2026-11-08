@@ -69,6 +69,8 @@ class TrainingConfig(BaseModel):
     device: str = "auto"
     learning_rate: float = 1e-4
     evaluation_battles_per_epoch: int = 0
+    shuffle_buffer_mib: StrictInt = Field(default=256, ge=1, le=4096)
+    evaluation_batch_size: StrictInt = Field(default=256, ge=1)
 
     @field_validator("method")
     @classmethod
@@ -90,6 +92,17 @@ class TrainingConfig(BaseModel):
         if v < 1:
             raise ValueError("batch_size et num_epochs doivent être >= 1")
         return v
+
+    @field_validator("shuffle_buffer_mib", "evaluation_batch_size", mode="before")
+    @classmethod
+    def _reject_non_strict_int(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("les booléens ne sont pas acceptés")
+        if isinstance(value, float):
+            raise ValueError("les flottants ne sont pas acceptés")
+        if isinstance(value, str):
+            raise ValueError("les chaînes numériques ne sont pas acceptées")
+        return value
 
     @field_validator("learning_rate")
     @classmethod
@@ -868,6 +881,7 @@ class TrainingResult(BaseModel):
     actor_delta_norm: float | None = None
     test_nll: float | None = None
     test_report_path: str | None = None
+    training_execution: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobStatus(str, Enum):

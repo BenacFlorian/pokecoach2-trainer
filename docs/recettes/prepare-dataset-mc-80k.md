@@ -56,4 +56,4 @@ Attendre `state: ready` et les dossiers `storage/datasets/ds-mb-mc-collectable-8
 
 ## Suite (hors prepare)
 
-Entraînement : `configs/finetune-mb-mc-prod.yaml` (`dataset_id` déjà aligné). Puis export + profil PokeCoach (`VGC_MODEL_PROFILE`).
+Entraînement : `configs/finetune-mb-mc-prod.yaml` (`dataset_id` déjà aligné, `shuffle_buffer_mib` / `evaluation_batch_size` à 256). Le trainer lit les pickles en flux : **aucune** étape de conversion supplémentaire sur un dataset `ready`. Mesurer d’abord avec `scripts/benchmark_training_pipeline.py` (`--max-files` petit) ; sur GPU loué, copier la config avec `device: cuda:0` explicite. Puis export + profil PokeCoach (`VGC_MODEL_PROFILE`).

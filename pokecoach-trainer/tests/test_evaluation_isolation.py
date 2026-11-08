@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from pokecoach_trainer.bc_adapter import duplicate_policy, evaluate_nll
@@ -23,11 +24,9 @@ def test_evaluation_isolation_preserves_training_state(tmp_path, monkeypatch):
     with torch.no_grad():
         pi.ability_embed.weight[1].fill_(100.0)
     filled = actor_weight_snapshot(policy)
-    try:
-        result = evaluate_nll(policy, demos, device)
-        assert result.transitions > 0
-    except ValueError:
-        pass
+    result = evaluate_nll(policy, demos, device)
+    assert result.transitions > 0
+    assert np.isfinite(result.nll)
     after = actor_weight_snapshot(policy)
     for key in filled:
         assert torch.equal(filled[key], after[key])

@@ -88,3 +88,23 @@ uv run --locked ruff check src tests
 ```
 
 SQLite embarquée : vérifier `sqlite3.sqlite_version` (correctif WAL recommandé pour la prod multi-processus).
+
+## Fine-tuning BC en flux (dataset ready)
+
+Le parcours `train_bc` lit les pickles **un par un** : pas de chargement intégral du split train en RAM. L’entraînement utilise un **tampon de mélange borné** (`shuffle_buffer_mib`, défaut 256 Mio pour les tableaux de transitions) ; l’**évaluation NLL** utilise un batch distinct (`evaluation_batch_size`, défaut 256).
+
+- **batch train** (`batch_size`) et **batch évaluation** sont indépendants ; en cas d’OOM à l’évaluation, diminuer `evaluation_batch_size` dans une copie de config (pas de retry automatique).
+- **RAM utile** ≈ tampon de shuffle + trajectoire pickle courante + batch courants + framework PyTorch/SB3 (pas un plafond RSS garanti).
+- Chaque epoch **relit tous les fichiers** train et applique un ordre de mélange **déterministe** (seed + numéro d’epoch) ; ce n’est pas l’ancien shuffle global du `DataLoader`, les poids peuvent différer légèrement à hyperparamètres égaux.
+- Mesurer CPU/GPU avant une location : sur VM GPU, mettre `device: cuda:0` explicitement dans la config d’exécution pour éviter un repli CPU silencieux avec `device: auto`.
+- Un dataset déjà `ready` se réutilise **sans** conversion ni nouveau cache disque.
+
+Profil production : `configs/finetune-mb-mc-prod.yaml`. Benchmark lecture seule (sous-ensemble de fichiers) :
+
+```bash
+uv run --locked python scripts/benchmark_training_pipeline.py \
+  --dataset-id ds-mb-mc-collectable-80k-v1 \
+  --base-model-id vgcbench-mb-reference \
+  --device cpu --max-files 8 \
+  --output /tmp/pokecoach-training-streaming-benchmark.json
+```

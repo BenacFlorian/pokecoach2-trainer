@@ -35,10 +35,7 @@ def test_validation_preserves_training_state_with_max_norm(tmp_path, monkeypatch
     with torch.no_grad():
         pi.ability_embed.weight[1].fill_(100.0)
     filled = actor_weight_snapshot(policy)
-    try:
-        evaluate_validation(policy, demos, device)
-    except ValueError:
-        pass
+    evaluate_validation(policy, demos, device)
     after = actor_weight_snapshot(policy)
     for key in filled:
         assert torch.equal(filled[key], after[key])

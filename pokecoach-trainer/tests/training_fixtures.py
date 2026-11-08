@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import pickle
 import shutil
 from pathlib import Path
@@ -102,6 +103,75 @@ def write_ready_dataset(
         encoding_contract_fingerprint=contract.fingerprint,
     )
     write_json_atomic(storage_path("datasets", dataset_id, "manifest.json"), manifest.model_dump(mode="json"))
+
+
+def write_ready_dataset_with_index(
+    dataset_id: str,
+    model: ModelConfig,
+    *,
+    train_steps: list[int] | None = None,
+    val_steps: list[int] | None = None,
+    test_steps: list[int] | None = None,
+    write_index: bool = False,
+) -> None:
+    """Dataset prêt avec un nombre de steps variable par fichier pickle."""
+
+    train_steps = train_steps if train_steps is not None else [3, 3, 3, 3]
+    val_steps = val_steps if val_steps is not None else [2, 2]
+    test_steps = test_steps if test_steps is not None else [3]
+
+    def _demo_traj(steps: int) -> Trajectory:
+        obs = np.zeros((steps + 1, 12 * chunk_obs_len), dtype=np.float32)
+        acts = np.zeros((steps, 2), dtype=np.int64)
+        acts[:, 1] = 1
+        return trajectory_to_imitation(Trajectory(obs=obs, acts=acts, infos=None, terminal=True))
+
+    index_rows: list[dict[str, object]] = []
+    totals = {"train": 0, "validation": 0, "test": 0}
+    counts = {"train": 0, "validation": 0, "test": 0}
+
+    for split, steps_list in (
+        ("train", train_steps),
+        ("validation", val_steps),
+        ("test", test_steps),
+    ):
+        d = storage_path("datasets", dataset_id, split)
+        d.mkdir(parents=True, exist_ok=True)
+        for i, n_steps in enumerate(steps_list):
+            traj = _demo_traj(n_steps)
+            fname = f"t{i}.pkl"
+            with (d / fname).open("wb") as f:
+                pickle.dump(traj, f)
+            totals[split] += n_steps
+            counts[split] += 1
+            if write_index:
+                index_rows.append(
+                    {
+                        "split": split,
+                        "file": fname,
+                        "file_sha256": sha256_file(d / fname),
+                        "transitions": n_steps,
+                    }
+                )
+
+    contract = build_contract(model)
+    manifest = DatasetManifest(
+        dataset_id=dataset_id,
+        state=DatasetState.ready,
+        transitions_train=totals["train"],
+        transitions_val=totals["validation"],
+        transitions_test=totals["test"],
+        trajectories_train=counts["train"],
+        trajectories_val=counts["validation"],
+        trajectories_test=counts["test"],
+        encoding_contract_fingerprint=contract.fingerprint,
+    )
+    write_json_atomic(storage_path("datasets", dataset_id, "manifest.json"), manifest.model_dump(mode="json"))
+    if write_index:
+        index_path = storage_path("datasets", dataset_id, "trajectory_index.jsonl")
+        with index_path.open("w", encoding="utf-8") as handle:
+            for row in index_rows:
+                handle.write(json.dumps(row) + "\n")
 
 
 def experiment_config(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,16 +17,20 @@ from pokecoach_trainer.base_model_service import (
     load_base_model,
     read_base_model_manifest,
 )
-from pokecoach_trainer.bc_adapter import (
-    CompleteBatchBC,
-    duplicate_policy,
-    evaluate_nll,
-)
+from pokecoach_trainer.bc_adapter import CompleteBatchBC, evaluate_nll
+from pokecoach_trainer.bc_evaluation import evaluate_nll_batches
 from pokecoach_trainer.dataset_service import get_dataset
 from pokecoach_trainer.errors import InvalidConfiguration
-from pokecoach_trainer.schemas import ExperimentConfig, TrainingResult
+from pokecoach_trainer.schemas import DatasetState, ExperimentConfig, TrainingResult
 from pokecoach_trainer.settings import storage_path
 from pokecoach_trainer.storage import sha256_file, write_json_atomic
+from pokecoach_trainer.training_data import (
+    SAMPLER_VERSION,
+    ShuffledTransitionBatches,
+    build_split_source,
+    iter_source_trajectories,
+    iter_transition_batches,
+)
 from pokecoach_trainer.trajectory_dataset import load_trajectory_pickle
 from pokecoach_trainer.upstream import vgc_bench_workdir
 
@@ -100,6 +105,8 @@ def build_ppo_container(model, device: str):
 
 
 def load_split_trajectories(dataset_id: str, split: str):
+    """Charge toutes les trajectoires d'un split (legacy / tests uniquement)."""
+
     directory = storage_path("datasets", dataset_id, split)
     files = sorted(directory.glob("*.pkl"))
     return [load_trajectory_pickle(p) for p in files]
@@ -137,6 +144,11 @@ def _require_initialization(config: ExperimentConfig) -> None:
         raise InvalidConfiguration("seul architecture=inherit est supporté")
 
 
+def _sync_cuda(device: str) -> None:
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
     """
     Fine-tune le parent enregistré via `CompleteBatchBC` (jamais `PPO.learn()`).
@@ -149,23 +161,26 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
     device = resolve_device(config.training.device)
 
     dataset_manifest = get_dataset(config.dataset_id)
+    if dataset_manifest.state != DatasetState.ready:
+        raise ValueError("dataset non ready")
     manifest_path = storage_path("datasets", config.dataset_id, "manifest.json")
     dataset_manifest_sha256 = sha256_file(manifest_path) if manifest_path.is_file() else None
 
-    parent_id = config.initialization.base_model_id
-    parent_manifest = read_base_model_manifest(parent_id)
-    assert_dataset_contract_compatible(parent_manifest, dataset_manifest)
-
-    train_demos = load_split_trajectories(config.dataset_id, "train")
-    val_demos = load_split_trajectories(config.dataset_id, "validation")
-    test_demos = load_split_trajectories(config.dataset_id, "test")
-    if not train_demos:
+    dataset_dir = storage_path("datasets", config.dataset_id)
+    train_source = build_split_source(dataset_dir, dataset_manifest, "train")
+    val_source = build_split_source(dataset_dir, dataset_manifest, "validation")
+    test_source = build_split_source(dataset_dir, dataset_manifest, "test")
+    if train_source.expected_transitions < 1 or not train_source.files:
         raise ValueError("split train vide")
 
     with vgc_bench_workdir():
         from vgc_bench.src.utils import set_global_seed
 
         set_global_seed(config.seed)
+
+    parent_id = config.initialization.base_model_id
+    parent_manifest = read_base_model_manifest(parent_id)
+    assert_dataset_contract_compatible(parent_manifest, dataset_manifest)
 
     parent_ckpt_path = storage_path("base_models", parent_id, parent_manifest.checkpoint_relpath)
     parent_digest_before = sha256_file(parent_ckpt_path)
@@ -180,6 +195,8 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
 
     rng = np.random.default_rng(config.seed)
     batch_size = config.training.batch_size
+    eval_batch_size = config.training.evaluation_batch_size
+    shuffle_buffer_mib = config.training.shuffle_buffer_mib
 
     bc = CompleteBatchBC(
         observation_space=ppo.observation_space,
@@ -191,8 +208,6 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
         device=device,
         optimizer_kwargs={"lr": config.training.learning_rate},
     )
-    bc.remember_trajectories(train_demos)
-    bc.set_demonstrations(train_demos)
 
     effective_lr = bc.optimizer.param_groups[0]["lr"]
     logger.info("BC optimizer lr effectif=%s", effective_lr)
@@ -205,10 +220,25 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
     observed_transitions: list[int] = []
 
     for epoch in range(1, config.training.num_epochs + 1):
-        t0 = datetime.now(timezone.utc)
-        bc.remember_trajectories(train_demos)
-        bc.set_demonstrations(train_demos)
+        epoch_wall_t0 = time.perf_counter()
+        shuffle = ShuffledTransitionBatches(
+            train_source,
+            batch_size=batch_size,
+            shuffle_buffer_mib=shuffle_buffer_mib,
+            seed=config.seed,
+            epoch=epoch,
+        )
+        bc.set_transition_batches(
+            shuffle,
+            expected_transitions=train_source.expected_transitions,
+            batch_size=batch_size,
+        )
+        train_t0 = time.perf_counter()
+        _sync_cuda(device)
         bc.train(n_epochs=1, progress_bar=False)
+        _sync_cuda(device)
+        train_duration_s = time.perf_counter() - train_t0
+        shuffle.close()
         steps = bc.last_train_stats.optimizer_steps
         transitions_epoch = bc.last_train_stats.transitions_seen
         if steps < 1:
@@ -219,13 +249,35 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
                 f"pas observés {steps} != attendus {expected_steps} "
                 f"(transitions={transitions_epoch}, batch={bc.batch_size})",
             )
+        if transitions_epoch != train_source.expected_transitions:
+            raise ValueError("transitions consommées != manifeste train")
 
-        train_eval = evaluate_nll(policy, train_demos, device)
-        if val_demos:
-            val_eval = evaluate_nll(policy, val_demos, device)
+        train_eval_t0 = time.perf_counter()
+        _sync_cuda(device)
+        train_eval_batches = iter_transition_batches(
+            iter_source_trajectories(train_source),
+            batch_size=eval_batch_size,
+        )
+        train_eval = evaluate_nll_batches(policy, train_eval_batches, device)
+        _sync_cuda(device)
+        train_eval_duration_s = time.perf_counter() - train_eval_t0
+
+        if val_source.files:
+            val_t0 = time.perf_counter()
+            _sync_cuda(device)
+            val_batches = iter_transition_batches(
+                iter_source_trajectories(val_source),
+                batch_size=eval_batch_size,
+            )
+            val_eval = evaluate_nll_batches(policy, val_batches, device)
+            _sync_cuda(device)
+            validation_duration_s = time.perf_counter() - val_t0
             val_nll = val_eval.nll
         else:
+            validation_duration_s = 0.0
             val_nll = float("nan")
+            val_eval = None
+
         train_losses.append(train_eval.nll)
         val_losses.append(val_nll)
         observed_steps.append(steps)
@@ -234,6 +286,8 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
         ckpt = run_dir / f"epoch_{epoch}"
         ppo.save(str(ckpt))
         checkpoints.append(str(ckpt) + ".zip")
+        epoch_wall_duration_s = time.perf_counter() - epoch_wall_t0
+        tps = transitions_epoch / train_duration_s if train_duration_s > 0 else float("inf")
         line = {
             "epoch": epoch,
             "train_nll": train_eval.nll,
@@ -246,13 +300,22 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
             "learning_rate": effective_lr,
             "device": device,
             "param_count": param_before,
-            "duration_s": (datetime.now(timezone.utc) - t0).total_seconds(),
+            "duration_s": epoch_wall_duration_s,
+            "training_batch_size": batch_size,
+            "evaluation_batch_size": eval_batch_size,
+            "shuffle_buffer_mib": shuffle_buffer_mib,
+            "sampler_version": SAMPLER_VERSION,
+            "train_duration_s": train_duration_s,
+            "train_eval_duration_s": train_eval_duration_s,
+            "validation_duration_s": validation_duration_s,
+            "train_transitions_per_s": tps,
+            "epoch_wall_duration_s": epoch_wall_duration_s,
         }
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(line) + "\n")
         if not np.isfinite(train_eval.nll):
             raise ValueError("métrique non finie")
-        if val_demos and not np.isfinite(val_nll):
+        if val_source.files and not np.isfinite(val_nll):
             raise ValueError("métrique validation non finie")
 
     after = actor_weight_snapshot(policy)
@@ -272,8 +335,12 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
 
     test_nll: float | None = None
     test_report_path: str | None = None
-    if test_demos:
-        test_eval = evaluate_nll(policy, test_demos, device)
+    if test_source.files:
+        test_batches = iter_transition_batches(
+            iter_source_trajectories(test_source),
+            batch_size=eval_batch_size,
+        )
+        test_eval = evaluate_nll_batches(policy, test_batches, device)
         test_nll = test_eval.nll
         test_report = {
             "test_nll": test_eval.nll,
@@ -284,6 +351,14 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
         }
         test_report_path = str(run_dir / "test_report.json")
         write_json_atomic(Path(test_report_path), test_report)
+
+    training_execution = {
+        "training_batch_size": batch_size,
+        "evaluation_batch_size": eval_batch_size,
+        "shuffle_buffer_mib": shuffle_buffer_mib,
+        "sampler_version": SAMPLER_VERSION,
+        "device": device,
+    }
 
     result = TrainingResult(
         run_id=run_dir.name,
@@ -307,6 +382,7 @@ def train_bc(config: ExperimentConfig, run_dir: Path) -> TrainingResult:
         actor_delta_norm=actor_delta,
         test_nll=test_nll,
         test_report_path=test_report_path,
+        training_execution=training_execution,
     )
     write_json_atomic(run_dir / "result.json", result.model_dump(mode="json"))
     return result
