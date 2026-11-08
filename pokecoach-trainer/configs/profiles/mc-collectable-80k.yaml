@@ -1,0 +1,44 @@
+# Profil opérationnel — archive M-B + M-C (~80 948 replays) puis fine-tune parent M-B → usage M-C.
+# Répertoire de travail : pokecoach-trainer/ (parent de storage/).
+# Ne pas utiliser --sync-legacy sauf besoin explicite de raw_logs.
+
+profile:
+  id: mb-mc-collectable-80k
+  dataset_id: ds-mb-mc-collectable-80k-v1
+  archive_replay_count: 80948
+  snapshot_config: configs/snapshot-mc-full-archive.yaml
+  recipe: configs/dataset-mb-mc-collectable.yaml
+  prepare_config: configs/prepare-mc-collectable.yaml
+  finetune_config: configs/finetune-mb-mc-prod.yaml
+
+steps:
+  - name: archive_snapshot
+    command: >-
+      uv run --locked pokecoach-trainer archive snapshot
+      --config configs/snapshot-mc-full-archive.yaml
+    note: Attendu ~80 948 refs (mb+mc). Snapshot « mc » seul ≈ 75 351 — à refaire si besoin.
+
+  - name: dataset_create
+    command: >-
+      uv run --locked pokecoach-trainer dataset create
+      --snapshot-id <SNAPSHOT_ID>
+      --recipe configs/dataset-mb-mc-collectable.yaml
+      --dataset-id ds-mb-mc-collectable-80k-v1
+    note: Recette alignée collecte filtrée (target_replays 80900). Vérifier le manifest (état, compteurs).
+
+  - name: dataset_prepare
+    command: >-
+      uv run --locked pokecoach-trainer dataset prepare
+      --dataset-id ds-mb-mc-collectable-80k-v1
+      --config configs/prepare-mc-collectable.yaml
+    note: Job long (ordre de grandeur 2–3 j en local à 3 workers). Attendre state ready.
+
+  - name: dataset_status
+    command: >-
+      uv run --locked pokecoach-trainer dataset show
+      --dataset-id ds-mb-mc-collectable-80k-v1
+
+  - name: finetune_gpu
+    command: >-
+      uv run --locked pokecoach-trainer train --config configs/finetune-mb-mc-prod.yaml
+    note: Sur pod GPU après rsync storage/datasets/ et base_models/.

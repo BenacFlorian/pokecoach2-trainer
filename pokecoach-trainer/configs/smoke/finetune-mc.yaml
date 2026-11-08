@@ -1,7 +1,7 @@
 experiment:
-  name: mc-smoke-local
+  name: bc-mb-to-mc-smoke
   seed: 42
-  dataset_id: mc-smoke-champions
+  dataset_id: ds-smoke-mc-300-v2
 initialization:
   mode: finetune
   base_model_id: vgcbench-mb-reference

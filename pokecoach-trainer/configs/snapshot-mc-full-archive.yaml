@@ -1,0 +1,8 @@
+# Snapshot global archive M-B + M-C (~80 948 replays indexés, nov. 2026).
+# À lancer avant dataset create ; noter snapshot_id= dans la sortie CLI.
+# Si un snapshot « mc » seul est déjà en cours, le refaire avec ce fichier.
+
+snapshot:
+  format_ids:
+    - mb
+    - mc

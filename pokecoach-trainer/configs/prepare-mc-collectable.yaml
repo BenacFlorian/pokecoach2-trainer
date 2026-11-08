@@ -1,0 +1,6 @@
+# Prepare prod M-C — machine locale type i5 4c / 16 Go (laisser ~1 cœur au système).
+# Vérifier les ressources : pokecoach-trainer dataset resources
+
+prepare:
+  conversion_workers: 3
+  conversion_timeout_s: 120

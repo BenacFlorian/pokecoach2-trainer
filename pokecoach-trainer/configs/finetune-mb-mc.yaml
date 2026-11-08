@@ -1,7 +1,8 @@
+# Smoke : utiliser configs/smoke/finetune-mc.yaml — ce fichier = prod 80k.
 experiment:
-  name: bc-mb-to-mc-smoke
+  name: bc-mb-to-mc-80k
   seed: 42
-  dataset_id: mc-natural-001
+  dataset_id: ds-mb-mc-collectable-80k-v1
 initialization:
   mode: finetune
   base_model_id: vgcbench-mb-reference

@@ -1,8 +1,9 @@
 # Recette alignée sur la collecte filtrée M-C (profil dataset collectable).
+# M-C seul (~75k) : utiliser snapshot format_ids [mc]. Mix M-B+M-C : dataset-mb-mc-collectable.yaml.
 dataset:
   variant: natural
   regulation: M-C
-  target_replays: 100000
+  target_replays: 80900
   seed: 42
   min_elo: 1100
   max_elo: null

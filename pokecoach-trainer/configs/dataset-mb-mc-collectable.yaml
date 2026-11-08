@@ -1,0 +1,24 @@
+# Recette M-B + M-C — snapshot format_ids [mb, mc], filtres collecte filtrée.
+# regulation : métadonnée manifest (pas de filtre réglement en V1) ; ~80 900 replays cibles.
+dataset:
+  variant: natural
+  regulation: M-B+M-C
+  target_replays: 80900
+  seed: 42
+  min_elo: 1100
+  max_elo: null
+  unknown_elo: exclude_perspective
+  only_winners: false
+  require_ots: true
+  require_complete_teams: true
+  include_bo1: true
+  include_bo3: true
+  include_forfeits: true
+  min_completed_turns_forfeit: 2
+  exclude_inactivity_losses: true
+  deduplicate: true
+  max_replays_per_team: null
+  splits:
+    train: 0.80
+    validation: 0.10
+    test: 0.10
