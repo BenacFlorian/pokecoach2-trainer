@@ -18,6 +18,7 @@ from pokecoach_trainer.schemas import (
     DatasetRecipe,
     DatasetState,
     FilterDecision,
+    FilterStage,
     JobRecord,
     LegacyImportDatasetSource,
     PrepareConfig,
@@ -428,7 +429,6 @@ def _prepare_snapshot_dataset(
 
     from pokecoach_trainer.archive_service import read_snapshot
     from pokecoach_trainer.compatibility import build_contract
-    from pokecoach_trainer.dataset_filters import decide_game, decide_perspective
     from pokecoach_trainer.dataset_split import assign_splits, build_replay_groups, select_groups
     from pokecoach_trainer.errors import BlockingMaskError
     from pokecoach_trainer.replay_metadata import extract_replay_metadata
@@ -478,21 +478,18 @@ def _prepare_snapshot_dataset(
     refs_by_id = {ref.replay_id: ref for ref in snapshot.refs}
     blocking_error: BlockingMaskError | None = None
 
+    from pokecoach_trainer.replay_policy import evaluate_replay_policy, filters_from_recipe
+
+    filters = filters_from_recipe(recipe)
     for index, ref in enumerate(snapshot.refs, start=1):
         meta = metas[ref.replay_id]
-        game_decision = decide_game(meta, recipe)
-        _record_decision(dataset_id, game_decision)
-        if not game_decision.accepted:
-            continue
-        perspectives_ok = False
-        for side in ("p1", "p2"):
-            decision = decide_perspective(meta, side, recipe)
+        eligibility = evaluate_replay_policy(meta, filters)
+        for decision in eligibility.decisions:
             _record_decision(dataset_id, decision)
-            if decision.accepted:
-                perspectives_ok = True
-                converted_tasks.append((ref, side))
-        if perspectives_ok:
+        if eligibility.accepted:
             admissible_replays.add(ref.replay_id)
+            for side in eligibility.accepted_sides:
+                converted_tasks.append((ref, side))
         if total_refs and (index == 1 or index == total_refs or index % 150 == 0):
             log.write(
                 f"prepare filtres {index}/{total_refs} "
@@ -513,6 +510,29 @@ def _prepare_snapshot_dataset(
         f"prepare sélection candidats admissibles={len(admissible_replays)} "
         f"perspectives={len(converted_tasks)}"
     )
+    if recipe.deduplicate:
+        from pokecoach_trainer.replay_deduplication import duplicate_replay_ids
+
+        aliases = duplicate_replay_ids(snapshot.refs, admissible_replays)
+        for alias_id, canonical_id in aliases.items():
+            admissible_replays.discard(alias_id)
+            _record_decision(
+                dataset_id,
+                FilterDecision(
+                    accepted=False,
+                    stage=FilterStage.selection,
+                    reason_code="duplicate_log",
+                    replay_id=alias_id,
+                    player_side=None,
+                    sources=["deduplicate"],
+                    details={"canonical_replay_id": canonical_id},
+                ),
+            )
+        converted_tasks = [
+            (ref, side)
+            for ref, side in converted_tasks
+            if ref.replay_id in admissible_replays
+        ]
     selected_groups, selected_count, overshoot = select_groups(
         groups,
         seed=recipe.seed,

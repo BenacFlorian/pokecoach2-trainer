@@ -203,19 +203,15 @@ class SplitRatios(BaseModel):
         return self
 
 
-class DatasetRecipe(BaseModel):
+class ReplayFilterConfig(BaseModel):
+    """Douze filtres métier partagés collecte ↔ dataset."""
+
     model_config = ConfigDict(extra="forbid")
 
-    variant: Literal["natural"] = "natural"
-    regulation: str = "M-C"
-    target_replays: int = 300
-    seed: int = 42
     min_elo: int | None = 1100
     max_elo: int | None = None
-    min_rating: int | None = None
     unknown_elo: Literal["exclude_perspective"] = "exclude_perspective"
     only_winners: bool = False
-    only_winner: bool | None = None
     require_ots: bool = True
     require_complete_teams: bool = True
     include_bo1: bool = True
@@ -224,6 +220,37 @@ class DatasetRecipe(BaseModel):
     min_completed_turns_forfeit: int = 3
     exclude_inactivity_losses: bool = True
     deduplicate: bool = True
+
+    @field_validator("min_elo", "max_elo")
+    @classmethod
+    def _elo_non_negative(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Elo doit être >= 0")
+        return v
+
+    @field_validator("min_completed_turns_forfeit")
+    @classmethod
+    def _forfeit_turns(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("min_completed_turns_forfeit doit être >= 0")
+        return v
+
+    @model_validator(mode="after")
+    def _min_max_elo(self) -> ReplayFilterConfig:
+        if self.min_elo is not None and self.max_elo is not None and self.min_elo > self.max_elo:
+            raise ValueError("min_elo doit être <= max_elo")
+        return self
+
+
+class DatasetRecipe(ReplayFilterConfig):
+    model_config = ConfigDict(extra="forbid")
+
+    variant: Literal["natural"] = "natural"
+    regulation: str = "M-C"
+    target_replays: int = 300
+    seed: int = 42
+    min_rating: int | None = None
+    only_winner: bool | None = None
     max_replays_per_team: int | None = None
     splits: SplitRatios = Field(default_factory=SplitRatios)
 
@@ -239,9 +266,9 @@ class DatasetRecipe(BaseModel):
     def _normalize_aliases(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
-        if data.get("max_replays_per_team") is not None:
-            raise ValueError("max_replays_per_team non nul refusé en V1")
         merged = dict(data)
+        if merged.get("max_replays_per_team") is not None:
+            raise ValueError("max_replays_per_team non nul refusé en V1")
         min_elo = merged.get("min_elo")
         min_rating = merged.get("min_rating")
         if min_rating is not None:
@@ -259,6 +286,12 @@ class DatasetRecipe(BaseModel):
         if min_elo is not None and max_elo is not None and min_elo > max_elo:
             raise ValueError("min_elo doit être <= max_elo")
         return merged
+
+    @model_validator(mode="after")
+    def _recipe_constraints(self) -> DatasetRecipe:
+        if self.max_replays_per_team is not None:
+            raise ValueError("max_replays_per_team non nul refusé en V1")
+        return self
 
 
 class TeamFilter(BaseModel):
@@ -353,6 +386,7 @@ class CollectionConfig(BaseModel):
     reinspect: bool = False
     shutdown_grace_s: int = 60
     team_filter: TeamFilter | None = None
+    dataset_filters: ReplayFilterConfig | None = None
     effective_upload_before: datetime | None = Field(default=None, exclude=True)
 
     @field_validator("format_ids")
@@ -549,6 +583,10 @@ class ArchiveSnapshot(BaseModel):
     refs: list[ArchiveRef]
     bo3_links_status: Literal["unknown", "partial", "confirmed"] = "unknown"
     replay_metadata: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    collection_filter_sha256: str | None = None
+    collection_dataset_filters: dict[str, Any] | None = None
+    collection_parser_version: str | None = None
+    collection_policy_version: str | None = None
 
 
 class SearchPage(BaseModel):

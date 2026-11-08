@@ -115,6 +115,20 @@ def test_fingerprint_ignores_effective_upper_bound():
     assert later.effective_upload_before != later2.effective_upload_before
 
 
+def test_collectable_yaml_from_other_cwd(tmp_path, monkeypatch):
+    from pokecoach_trainer.collection_config import load_collection_config
+    from pokecoach_trainer.settings import PACKAGE_ROOT
+
+    monkeypatch.chdir(tmp_path)
+    cfg = load_collection_config(PACKAGE_ROOT / "configs" / "collection-mc-100k-valid.yaml")
+    assert cfg.dataset_filters is not None
+    assert cfg.dataset_filters.min_elo == 1100
+    assert cfg.dataset_filters.min_completed_turns_forfeit == 2
+    assert cfg.dataset_filters.exclude_inactivity_losses is True
+    assert cfg.dataset_filters.require_ots is True
+    assert cfg.dataset_filters.require_complete_teams is True
+
+
 def test_max_new_replays_alias():
     cfg = CollectionConfig.model_validate({"format_ids": ["mc"], "max_new_replays": 42})
     assert cfg.max_selected_replays == 42

@@ -432,35 +432,74 @@ def create_campaign_snapshot(campaign_id: str) -> ArchiveSnapshot:
     initialize_catalog(root)
     with catalog_connection(root) as conn:
         row = conn.execute(
-            "SELECT effective_config_json FROM campaigns WHERE campaign_id = ?",
+            """
+            SELECT effective_config_json, validation_parser_version, validation_policy_version
+            FROM campaigns WHERE campaign_id = ?
+            """,
             (campaign_id,),
         ).fetchone()
         if row is None:
             raise NotFound("campagne introuvable", details={"campaign_id": campaign_id})
         effective_json = row["effective_config_json"]
+        stored_parser = row["validation_parser_version"]
+        stored_policy = row["validation_policy_version"]
+    from pokecoach_trainer.collection_filters import filter_fingerprint
+    from pokecoach_trainer.replay_metadata import REPLAY_METADATA_VERSION
+    from pokecoach_trainer.replay_policy import FILTER_POLICY_VERSION
+    from pokecoach_trainer.schemas import CollectionConfig
+
+    effective = json.loads(effective_json)
+    config = CollectionConfig.model_validate(effective)
+    if config.dataset_filters is not None:
+        if stored_parser and stored_parser != REPLAY_METADATA_VERSION:
+            raise InvalidConfiguration(
+                "parseur incompatible avec la campagne filtrée ; créer une nouvelle campagne"
+            )
+        if stored_policy and stored_policy != FILTER_POLICY_VERSION:
+            raise InvalidConfiguration(
+                "politique incompatible avec la campagne filtrée ; créer une nouvelle campagne"
+            )
     with catalog_maintenance_shared(root):
         max_seq = catalog_max_publication_seq(root)
-        refs, _ = catalog_list_campaign_replays(
-            root,
-            campaign_id,
-            offset=0,
-            limit=1_000_000,
-            max_publication_seq=max_seq,
-        )
+        refs: list = []
+        offset = 0
+        while True:
+            page, total = catalog_list_campaign_replays(
+                root,
+                campaign_id,
+                offset=offset,
+                limit=1000,
+                max_publication_seq=max_seq,
+            )
+            refs.extend(page)
+            offset += len(page)
+            if offset >= total or not page:
+                break
     replay_metadata: dict[str, dict[str, Any]] = {}
     for ref in refs:
         try:
             replay_metadata[ref.replay_id] = metadata_to_dict(extract_replay_metadata(ref))
-        except (ValueError, OSError):
+        except (ValueError, OSError, NotFound):
+            if config.dataset_filters is not None:
+                raise InvalidConfiguration(
+                    f"métadonnées manquantes pour {ref.replay_id} dans une campagne filtrée"
+                ) from None
             continue
-    effective = json.loads(effective_json)
     format_ids = sorted(effective.get("format_ids") or [])
+    collection_fp = filter_fingerprint(config) if config.dataset_filters is not None else None
+    dataset_filters = (
+        config.dataset_filters.model_dump(mode="json") if config.dataset_filters is not None else None
+    )
     payload = {
         "campaign_id": campaign_id,
         "format_ids": format_ids,
         "refs": [r.model_dump(mode="json") for r in refs],
         "metadata_version": 2,
         "replay_metadata": replay_metadata,
+        "collection_filter_sha256": collection_fp,
+        "collection_dataset_filters": dataset_filters,
+        "collection_parser_version": stored_parser,
+        "collection_policy_version": stored_policy,
     }
     snapshot_sha256 = canonical_json_sha256(payload)
     snapshot_id = new_opaque_id("snap-")
@@ -474,6 +513,10 @@ def create_campaign_snapshot(campaign_id: str) -> ArchiveSnapshot:
         refs=refs,
         replay_metadata=replay_metadata,
         bo3_links_status="partial" if replay_metadata else "unknown",
+        collection_filter_sha256=collection_fp,
+        collection_dataset_filters=dataset_filters,
+        collection_parser_version=stored_parser,
+        collection_policy_version=stored_policy,
     )
     with _metadata_lock():
         snap_path = _archive_root() / _SNAPSHOTS_DIR / f"{snapshot_id}.json"

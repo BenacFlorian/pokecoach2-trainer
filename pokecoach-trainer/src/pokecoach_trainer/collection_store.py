@@ -22,6 +22,7 @@ from pokecoach_trainer.collection_types import (
     CampaignView,
     ClaimResult,
     Clock,
+    CollectionEvaluation,
     DiscoveryPage,
     SearchItem,
     SelectionDecision,
@@ -32,12 +33,14 @@ from pokecoach_trainer.collection_types import (
 from pokecoach_trainer.errors import Conflict, NotFound, StaleLease
 from pokecoach_trainer.jobs import save_job
 from pokecoach_trainer.schemas import (
+    ArchiveRef,
     CollectionBudgets,
     CollectionConfig,
     CollectionJobConfig,
     JobKind,
     JobRecord,
     JobStatus,
+    ReplayMetadata,
     RetryFailedRequest,
 )
 from pokecoach_trainer.storage import new_opaque_id
@@ -154,6 +157,7 @@ class CollectionStore:
                     (active["campaign_id"],),
                 ).fetchone()
                 if existing and existing["request_fingerprint"] == fingerprint:
+                    self._assert_validation_versions(conn, active["campaign_id"], normalized)
                     view = self._campaign_view(conn, active["campaign_id"])
                     self._persist_job(view)
                     return view
@@ -161,13 +165,21 @@ class CollectionStore:
             campaign_id = new_opaque_id("job-")
             attempt_id = new_opaque_id("attempt-")
             ts = int(now.timestamp())
+            parser_v = policy_v = None
+            if normalized.dataset_filters is not None:
+                from pokecoach_trainer.replay_metadata import REPLAY_METADATA_VERSION
+                from pokecoach_trainer.replay_policy import FILTER_POLICY_VERSION
+
+                parser_v = REPLAY_METADATA_VERSION
+                policy_v = FILTER_POLICY_VERSION
             conn.execute(
                 """
                 INSERT INTO campaigns(
                     campaign_id, request_fingerprint, request_config_json,
                     effective_config_json, phase, active_slot, attempt_id,
-                    discovery_workers, download_workers, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'running', 1, ?, ?, ?, ?, ?)
+                    discovery_workers, download_workers, created_at, updated_at,
+                    validation_parser_version, validation_policy_version
+                ) VALUES (?, ?, ?, ?, 'running', 1, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     campaign_id,
@@ -179,6 +191,8 @@ class CollectionStore:
                     normalized.download_workers,
                     ts,
                     ts,
+                    parser_v,
+                    policy_v,
                 ),
             )
             deadline = self._clock.wall() + normalized.max_duration_s
@@ -236,13 +250,41 @@ class CollectionStore:
             content_sha256=row["content_sha256"] or "",
         )
 
+    def _assert_validation_versions(
+        self, conn: sqlite3.Connection, campaign_id: str, config: CollectionConfig
+    ) -> None:
+        if config.dataset_filters is None:
+            return
+        from pokecoach_trainer.replay_metadata import REPLAY_METADATA_VERSION
+        from pokecoach_trainer.replay_policy import FILTER_POLICY_VERSION
+
+        row = conn.execute(
+            """
+            SELECT validation_parser_version, validation_policy_version
+            FROM campaigns WHERE campaign_id=?
+            """,
+            (campaign_id,),
+        ).fetchone()
+        if row is None:
+            return
+        stored_parser = row["validation_parser_version"]
+        stored_policy = row["validation_policy_version"]
+        if stored_parser and stored_parser != REPLAY_METADATA_VERSION:
+            raise Conflict(
+                "parseur de validation incompatible avec la campagne filtrée ; créer une nouvelle campagne"
+            )
+        if stored_policy and stored_policy != FILTER_POLICY_VERSION:
+            raise Conflict(
+                "politique de validation incompatible avec la campagne filtrée ; créer une nouvelle campagne"
+            )
+
     def _reevaluate_known_metadata(
         self,
         conn: sqlite3.Connection,
         campaign_id: str,
         config: CollectionConfig,
     ) -> None:
-        """Réévalue les métadonnées persistées pour la sélection courante (sans découverte)."""
+        """Planifie un travail borné sur les IDs connus, sans sélection directe."""
 
         source_formats: list[str] = []
         for format_id in config.format_ids:
@@ -252,22 +294,22 @@ class CollectionStore:
         placeholders = ",".join("?" * len(source_formats))
         current_fp = filter_fingerprint(config)
         batch = 500
-        offset = 0
+        last_id = ""
         while True:
             rows = conn.execute(
                 f"""
-                SELECT rs.replay_id, rs.source_format, rs.uploadtime, rs.p1_json, rs.p2_json,
-                       rs.parser_version, rs.content_sha256
+                SELECT rs.replay_id, rs.source_format, rs.uploadtime
                 FROM replay_summaries rs
-                WHERE rs.source_format IN ({placeholders})
+                WHERE rs.source_format IN ({placeholders}) AND rs.replay_id > ?
                 ORDER BY rs.replay_id
-                LIMIT ? OFFSET ?
+                LIMIT ?
                 """,
-                (*source_formats, batch, offset),
+                (*source_formats, last_id, batch),
             ).fetchall()
             if not rows:
                 break
             for row in rows:
+                last_id = row["replay_id"]
                 prior = conn.execute(
                     """
                     SELECT decision, filter_sha256 FROM campaign_replays
@@ -277,57 +319,69 @@ class CollectionStore:
                 ).fetchone()
                 if prior and prior["decision"] == "selected":
                     continue
-                if prior and prior["filter_sha256"] == current_fp and prior["decision"] == "rejected":
+                if (
+                    prior
+                    and prior["filter_sha256"] == current_fp
+                    and prior["decision"] == "rejected"
+                    and not config.reinspect
+                ):
                     continue
-                summary = self._summary_from_row(row)
-                uploadtime = int(row["uploadtime"]) if row["uploadtime"] is not None else None
-                decision = evaluate_selection(
-                    config, uploadtime=uploadtime, summary=summary
-                )
-                conn.execute(
+                summary_row = conn.execute(
                     """
-                    INSERT INTO campaign_replays(
-                        campaign_id, replay_id, decision, reason, filter_sha256
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(campaign_id, replay_id) DO UPDATE SET
-                        decision=excluded.decision, reason=excluded.reason,
-                        filter_sha256=excluded.filter_sha256
+                    SELECT p1_json, p2_json, parser_version, content_sha256, uploadtime
+                    FROM replay_summaries WHERE replay_id=?
                     """,
-                    (
-                        campaign_id,
-                        row["replay_id"],
-                        "selected" if decision.selected else "rejected",
-                        decision.reason,
-                        decision.filter_sha256,
-                    ),
-                )
-                if decision.selected:
-                    task = conn.execute(
-                        "SELECT state FROM download_tasks WHERE replay_id=?",
+                    (row["replay_id"],),
+                ).fetchone()
+                summary = self._summary_from_row(summary_row) if summary_row else None
+                uploadtime = int(row["uploadtime"]) if row["uploadtime"] is not None else None
+                date_team = evaluate_selection(config, uploadtime=uploadtime, summary=summary)
+                if not date_team.selected:
+                    conn.execute(
+                        """
+                        INSERT INTO campaign_replays(
+                            campaign_id, replay_id, decision, reason, filter_sha256
+                        ) VALUES (?, ?, 'rejected', ?, ?)
+                        ON CONFLICT(campaign_id, replay_id) DO UPDATE SET
+                            decision='rejected', reason=excluded.reason,
+                            filter_sha256=excluded.filter_sha256
+                        """,
+                        (
+                            campaign_id,
+                            row["replay_id"],
+                            date_team.reason,
+                            date_team.filter_sha256,
+                        ),
+                    )
+                    continue
+                task = conn.execute(
+                    "SELECT state FROM download_tasks WHERE replay_id=?",
+                    (row["replay_id"],),
+                ).fetchone()
+                if task is None:
+                    conn.execute(
+                        """
+                        INSERT INTO download_tasks(replay_id, source_format, uploadtime, state)
+                        VALUES (?, ?, ?, 'pending')
+                        """,
+                        (row["replay_id"], row["source_format"], row["uploadtime"]),
+                    )
+                elif task["state"] in {
+                    "examined_only",
+                    "failed",
+                    "retry_wait",
+                    "unavailable",
+                    "archived",
+                }:
+                    if prior and prior["decision"] == "selected":
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE download_tasks SET state='pending', retry_at=NULL, last_error=NULL
+                        WHERE replay_id=?
+                        """,
                         (row["replay_id"],),
-                    ).fetchone()
-                    if task is None:
-                        conn.execute(
-                            """
-                            INSERT INTO download_tasks(replay_id, source_format, uploadtime, state)
-                            VALUES (?, ?, ?, 'pending')
-                            """,
-                            (row["replay_id"], row["source_format"], row["uploadtime"]),
-                        )
-                    elif task["state"] in {
-                        "examined_only",
-                        "failed",
-                        "retry_wait",
-                        "unavailable",
-                    }:
-                        conn.execute(
-                            """
-                            UPDATE download_tasks SET state='pending', retry_at=NULL, last_error=NULL
-                            WHERE replay_id=?
-                            """,
-                            (row["replay_id"],),
-                        )
-            offset += batch
+                    )
 
     def get_campaign(self, campaign_id: str) -> CampaignView:
         with catalog_connection(self._root) as conn:
@@ -622,21 +676,50 @@ class CollectionStore:
             ).fetchone()
             if attempt["selected_in_attempt"] + attempt["reserved_slots"] >= attempt["max_selected_replays"]:
                 return ClaimResult(lease=None, wait_s=1.0, reason="selection_full")
+            current_fp = filter_fingerprint(config)
+            format_clause = ""
+            format_params: list[str] = []
+            if config.dataset_filters is not None:
+                for format_id in config.format_ids:
+                    format_params.extend(resolve_format(format_id).source_format_ids)
+                if format_params:
+                    placeholders = ",".join("?" * len(format_params))
+                    format_clause = f" AND d.source_format IN ({placeholders})"
             row = conn.execute(
-                """
-                SELECT replay_id, source_format, uploadtime, durable_attempts, state
-                FROM download_tasks
+                f"""
+                SELECT d.replay_id, d.source_format, d.uploadtime, d.durable_attempts, d.state
+                FROM download_tasks d
                 WHERE (
-                    (state='pending' AND (retry_at IS NULL OR retry_at <= ?))
+                    (d.state IN ('pending', 'retry_wait') AND (d.retry_at IS NULL OR d.retry_at <= ?))
                     OR (
-                        state='leased' AND (
-                            lease_expires_wall <= ? OR lease_boot_id IS NULL OR lease_boot_id != ?
+                        d.state='leased' AND (
+                            d.lease_expires_wall <= ? OR d.lease_boot_id IS NULL OR d.lease_boot_id != ?
                         )
                     )
                 )
-                ORDER BY replay_id LIMIT 1
+                AND NOT EXISTS (
+                    SELECT 1 FROM campaign_replays cr
+                    WHERE cr.campaign_id=? AND cr.replay_id=d.replay_id
+                      AND (
+                        cr.decision='selected'
+                        OR (cr.decision='rejected' AND cr.filter_sha256=? AND ?=0)
+                      )
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM publication_intents pi WHERE pi.replay_id = d.replay_id
+                )
+                {format_clause}
+                ORDER BY d.replay_id LIMIT 1
                 """,
-                (self._clock.wall(), self._clock.wall(), self._clock.boot_id()),
+                (
+                    self._clock.wall(),
+                    self._clock.wall(),
+                    self._clock.boot_id(),
+                    campaign_id,
+                    current_fp,
+                    1 if config.reinspect else 0,
+                    *format_params,
+                ),
             ).fetchone()
             if row is None:
                 return ClaimResult(lease=None, wait_s=0.5, reason="queue_empty")
@@ -645,10 +728,14 @@ class CollectionStore:
             boot = self._clock.boot_id()
             if row["state"] == "leased":
                 prev = conn.execute(
-                    "SELECT reserved_attempt_id FROM download_tasks WHERE replay_id=?",
+                    "SELECT reserved_attempt_id, lease_token FROM download_tasks WHERE replay_id=?",
                     (row["replay_id"],),
                 ).fetchone()
                 prev_attempt = prev["reserved_attempt_id"] if prev else camp["attempt_id"]
+                old_token = prev["lease_token"] if prev else None
+                self._release_abandoned_log_claims(
+                    conn, campaign_id=campaign_id, lease_token=old_token
+                )
                 conn.execute(
                     """
                     UPDATE attempts SET reserved_slots = MAX(0, reserved_slots - 1)
@@ -662,7 +749,7 @@ class CollectionStore:
                        lease_expires_mon=?, lease_expires_wall=?, lease_boot_id=?,
                        reserved_slot=1, reserved_attempt_id=?
                 WHERE replay_id=? AND (
-                    state='pending'
+                    state IN ('pending', 'retry_wait')
                     OR (
                         state='leased' AND (
                             lease_expires_wall <= ? OR lease_boot_id IS NULL OR lease_boot_id != ?
@@ -1147,6 +1234,29 @@ class CollectionStore:
             attempts_used=lease.attempts_used,
         )
 
+    def _release_abandoned_log_claims(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        campaign_id: str,
+        lease_token: str | None,
+    ) -> None:
+        if not lease_token:
+            return
+        intent = conn.execute(
+            "SELECT 1 FROM publication_intents WHERE lease_token=?",
+            (lease_token,),
+        ).fetchone()
+        if intent is not None:
+            return
+        conn.execute(
+            """
+            DELETE FROM campaign_log_claims
+            WHERE campaign_id=? AND lease_token=? AND state='pending'
+            """,
+            (campaign_id, lease_token),
+        )
+
     def release_lease(self, lease: TaskLease, *, retry_at: float | None = None) -> None:
         with self._tx() as conn:
             if lease.kind == "download":
@@ -1162,6 +1272,9 @@ class CollectionStore:
                 )
                 if cur.rowcount != 1:
                     raise StaleLease("jeton invalide à la libération")
+                self._release_abandoned_log_claims(
+                    conn, campaign_id=lease.campaign_id, lease_token=lease.token
+                )
                 conn.execute(
                     """
                     UPDATE attempts SET reserved_slots = MAX(0, reserved_slots - 1)
@@ -1224,6 +1337,9 @@ class CollectionStore:
             )
             if cur.rowcount != 1:
                 raise StaleLease("jeton invalide")
+            self._release_abandoned_log_claims(
+                conn, campaign_id=lease.campaign_id, lease_token=lease.token
+            )
             conn.execute(
                 "UPDATE attempts SET reserved_slots = MAX(0, reserved_slots - 1) WHERE attempt_id=?",
                 (lease.attempt_id,),
@@ -1340,6 +1456,451 @@ class CollectionStore:
                     """,
                     (lease.attempt_id,),
                 )
+
+    def get_cached_metadata(self, ref: ArchiveRef) -> ReplayMetadata | None:
+        from pokecoach_trainer.replay_metadata import REPLAY_METADATA_VERSION
+
+        with catalog_connection(self._root) as conn:
+            row = conn.execute(
+                """
+                SELECT metadata_json FROM replay_metadata_cache
+                WHERE replay_id=? AND content_sha256=? AND parser_version=?
+                """,
+                (ref.replay_id, ref.content_sha256, REPLAY_METADATA_VERSION),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            meta = ReplayMetadata.model_validate_json(row["metadata_json"])
+        except Exception:
+            return None
+        if (
+            meta.replay_id != ref.replay_id
+            or meta.raw_sha256 != ref.content_sha256
+            or meta.parser_version != REPLAY_METADATA_VERSION
+        ):
+            return None
+        return meta
+
+    def cache_metadata(
+        self,
+        metadata: ReplayMetadata,
+        *,
+        source_format: str,
+        uploadtime: int | None,
+    ) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO replay_metadata_cache(
+                    replay_id, content_sha256, parser_version, log_sha256,
+                    source_format, uploadtime, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(replay_id, content_sha256, parser_version) DO UPDATE SET
+                    log_sha256=excluded.log_sha256,
+                    source_format=excluded.source_format,
+                    uploadtime=excluded.uploadtime,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    metadata.replay_id,
+                    metadata.raw_sha256,
+                    metadata.parser_version,
+                    metadata.log_sha256,
+                    source_format,
+                    uploadtime,
+                    metadata.model_dump_json(),
+                ),
+            )
+
+    def _release_download_reservation(
+        self, conn: sqlite3.Connection, lease: TaskLease, *, state: str
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE download_tasks SET state=?, reserved_slot=0,
+                   owner_worker=NULL, lease_token=NULL, lease_expires_mon=NULL,
+                   lease_expires_wall=NULL, lease_boot_id=NULL
+            WHERE replay_id=? AND lease_token=?
+            """,
+            (state, lease.task_id, lease.token),
+        )
+        conn.execute(
+            "UPDATE attempts SET reserved_slots = MAX(0, reserved_slots - 1) WHERE attempt_id=?",
+            (lease.attempt_id,),
+        )
+
+    def record_evaluation(
+        self,
+        lease: TaskLease,
+        ref: ArchiveRef,
+        evaluation: CollectionEvaluation,
+    ) -> Literal["rejected", "ready", "duplicate", "wait"]:
+        decision = evaluation.selection
+        with self._tx() as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM download_tasks WHERE replay_id=? AND lease_token=?",
+                (lease.task_id, lease.token),
+            ).fetchone()
+            if cur is None:
+                raise StaleLease("jeton invalide pour évaluation")
+            if evaluation.metadata is not None:
+                conn.execute(
+                    """
+                    INSERT INTO replay_metadata_cache(
+                        replay_id, content_sha256, parser_version, log_sha256,
+                        source_format, uploadtime, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(replay_id, content_sha256, parser_version) DO UPDATE SET
+                        log_sha256=excluded.log_sha256,
+                        source_format=excluded.source_format,
+                        uploadtime=excluded.uploadtime,
+                        metadata_json=excluded.metadata_json
+                    """,
+                    (
+                        evaluation.metadata.replay_id,
+                        evaluation.metadata.raw_sha256,
+                        evaluation.metadata.parser_version,
+                        evaluation.metadata.log_sha256,
+                        ref.format_id,
+                        ref.uploadtime,
+                        evaluation.metadata.model_dump_json(),
+                    ),
+                )
+            summary = evaluation.summary
+            if summary:
+                p1 = json.dumps(list(summary.p1)) if summary.p1 else None
+                p2 = json.dumps(list(summary.p2)) if summary.p2 else None
+                conn.execute(
+                    """
+                    INSERT INTO replay_summaries(
+                        replay_id, source_format, uploadtime, p1_json, p2_json,
+                        parser_version, content_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(replay_id) DO UPDATE SET
+                        source_format=excluded.source_format,
+                        uploadtime=COALESCE(excluded.uploadtime, replay_summaries.uploadtime),
+                        p1_json=excluded.p1_json, p2_json=excluded.p2_json,
+                        parser_version=excluded.parser_version,
+                        content_sha256=excluded.content_sha256
+                    """,
+                    (
+                        lease.replay_id,
+                        ref.format_id,
+                        ref.uploadtime,
+                        p1,
+                        p2,
+                        summary.parser_version,
+                        summary.content_sha256,
+                    ),
+                )
+            detail = json.dumps(
+                {
+                    "reason": decision.reason,
+                    "accepted_sides": list(evaluation.eligibility.accepted_sides)
+                    if evaluation.eligibility
+                    else [],
+                    "eligibility_reason": evaluation.eligibility.reason_code
+                    if evaluation.eligibility
+                    else decision.reason,
+                },
+                sort_keys=True,
+            )
+            if not decision.selected:
+                conn.execute(
+                    """
+                    INSERT INTO campaign_replays(
+                        campaign_id, replay_id, decision, reason, filter_sha256,
+                        version_content_sha256, log_sha256, decision_json
+                    ) VALUES (?, ?, 'rejected', ?, ?, ?, ?, ?)
+                    ON CONFLICT(campaign_id, replay_id) DO UPDATE SET
+                        decision='rejected', reason=excluded.reason,
+                        filter_sha256=excluded.filter_sha256,
+                        log_sha256=excluded.log_sha256,
+                        decision_json=excluded.decision_json
+                    """,
+                    (
+                        lease.campaign_id,
+                        lease.replay_id,
+                        decision.reason,
+                        decision.filter_sha256,
+                        ref.content_sha256,
+                        ref.log_sha256,
+                        detail,
+                    ),
+                )
+                self._release_download_reservation(conn, lease, state="examined_only")
+                return "rejected"
+
+            config = CollectionConfig.model_validate_json(
+                conn.execute(
+                    "SELECT effective_config_json FROM campaigns WHERE campaign_id=?",
+                    (lease.campaign_id,),
+                ).fetchone()["effective_config_json"]
+            )
+            existing = conn.execute(
+                """
+                SELECT decision, version_content_sha256 FROM campaign_replays
+                WHERE campaign_id=? AND replay_id=?
+                """,
+                (lease.campaign_id, lease.replay_id),
+            ).fetchone()
+            if existing and existing["decision"] == "selected":
+                self._release_download_reservation(conn, lease, state="archived")
+                return "duplicate"
+            if config.dataset_filters is not None and config.dataset_filters.deduplicate:
+                claim = conn.execute(
+                    """
+                    SELECT replay_id, content_sha256, lease_token, state
+                    FROM campaign_log_claims
+                    WHERE campaign_id=? AND log_sha256=?
+                    """,
+                    (lease.campaign_id, ref.log_sha256),
+                ).fetchone()
+                if claim and claim["replay_id"] != lease.replay_id:
+                    if claim["state"] == "selected":
+                        conn.execute(
+                            """
+                            INSERT INTO campaign_replays(
+                                campaign_id, replay_id, decision, reason, filter_sha256,
+                                log_sha256, decision_json
+                            ) VALUES (?, ?, 'rejected', 'duplicate_log', ?, ?, ?)
+                            ON CONFLICT(campaign_id, replay_id) DO UPDATE SET
+                                decision='rejected', reason='duplicate_log',
+                                filter_sha256=excluded.filter_sha256,
+                                log_sha256=excluded.log_sha256,
+                                decision_json=excluded.decision_json
+                            """,
+                            (
+                                lease.campaign_id,
+                                lease.replay_id,
+                                decision.filter_sha256,
+                                ref.log_sha256,
+                                json.dumps(
+                                    {"canonical_replay_id": claim["replay_id"]},
+                                    sort_keys=True,
+                                ),
+                            ),
+                        )
+                        self._release_download_reservation(conn, lease, state="examined_only")
+                        return "duplicate"
+                    conn.execute(
+                        """
+                        UPDATE download_tasks SET state='retry_wait', retry_at=?,
+                               reserved_slot=0, owner_worker=NULL, lease_token=NULL,
+                               lease_expires_mon=NULL, lease_expires_wall=NULL, lease_boot_id=NULL
+                        WHERE replay_id=? AND lease_token=?
+                        """,
+                        (self._clock.wall() + 2.0, lease.task_id, lease.token),
+                    )
+                    conn.execute(
+                        "UPDATE attempts SET reserved_slots = MAX(0, reserved_slots - 1) WHERE attempt_id=?",
+                        (lease.attempt_id,),
+                    )
+                    return "wait"
+                conn.execute(
+                    """
+                    INSERT INTO campaign_log_claims(
+                        campaign_id, log_sha256, replay_id, content_sha256, lease_token, state
+                    ) VALUES (?, ?, ?, ?, ?, 'pending')
+                    ON CONFLICT(campaign_id, log_sha256) DO UPDATE SET
+                        replay_id=excluded.replay_id,
+                        content_sha256=excluded.content_sha256,
+                        lease_token=excluded.lease_token,
+                        state='pending'
+                    WHERE campaign_log_claims.state='pending'
+                      AND campaign_log_claims.lease_token=excluded.lease_token
+                    """,
+                    (
+                        lease.campaign_id,
+                        ref.log_sha256,
+                        lease.replay_id,
+                        ref.content_sha256,
+                        lease.token,
+                    ),
+                )
+                claimed = conn.execute(
+                    """
+                    SELECT replay_id FROM campaign_log_claims
+                    WHERE campaign_id=? AND log_sha256=?
+                    """,
+                    (lease.campaign_id, ref.log_sha256),
+                ).fetchone()
+                if claimed and claimed["replay_id"] != lease.replay_id:
+                    conn.execute(
+                        """
+                        UPDATE download_tasks SET state='retry_wait', retry_at=?,
+                               reserved_slot=0, owner_worker=NULL, lease_token=NULL,
+                               lease_expires_mon=NULL, lease_expires_wall=NULL, lease_boot_id=NULL
+                        WHERE replay_id=? AND lease_token=?
+                        """,
+                        (self._clock.wall() + 2.0, lease.task_id, lease.token),
+                    )
+                    conn.execute(
+                        "UPDATE attempts SET reserved_slots = MAX(0, reserved_slots - 1) WHERE attempt_id=?",
+                        (lease.attempt_id,),
+                    )
+                    return "wait"
+            conn.execute(
+                """
+                INSERT INTO campaign_replays(
+                    campaign_id, replay_id, decision, reason, filter_sha256,
+                    version_content_sha256, log_sha256, decision_json
+                ) VALUES (?, ?, 'pending_publication', ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id, replay_id) DO UPDATE SET
+                    decision='pending_publication', reason=excluded.reason,
+                    filter_sha256=excluded.filter_sha256,
+                    version_content_sha256=excluded.version_content_sha256,
+                    log_sha256=excluded.log_sha256,
+                    decision_json=excluded.decision_json
+                WHERE campaign_replays.decision != 'selected'
+                """,
+                (
+                    lease.campaign_id,
+                    lease.replay_id,
+                    decision.reason,
+                    decision.filter_sha256,
+                    ref.content_sha256,
+                    ref.log_sha256,
+                    detail,
+                ),
+            )
+            return "ready"
+
+    def finalize_selection(
+        self, lease: TaskLease, ref: ArchiveRef, *, new_version: bool
+    ) -> bool:
+        with self._tx() as conn:
+            return self._finalize_selection_conn(
+                conn, lease.campaign_id, lease.attempt_id, ref, lease=lease, new_version=new_version
+            )
+
+    def finalize_recovered_publication(
+        self,
+        *,
+        campaign_id: str,
+        attempt_id: str | None,
+        ref: ArchiveRef,
+        new_version: bool,
+    ) -> bool:
+        with self._tx() as conn:
+            return self._finalize_selection_conn(
+                conn, campaign_id, attempt_id, ref, lease=None, new_version=new_version
+            )
+
+    def _finalize_selection_conn(
+        self,
+        conn: sqlite3.Connection,
+        campaign_id: str,
+        attempt_id: str | None,
+        ref: ArchiveRef,
+        *,
+        lease: TaskLease | None,
+        new_version: bool,
+    ) -> bool:
+        present = conn.execute(
+            """
+            SELECT 1 FROM replay_versions WHERE replay_id=? AND content_sha256=?
+            """,
+            (ref.replay_id, ref.content_sha256),
+        ).fetchone()
+        if present is None:
+            return False
+        if lease is not None:
+            cur = conn.execute(
+                "SELECT 1 FROM download_tasks WHERE replay_id=? AND lease_token=?",
+                (lease.task_id, lease.token),
+            ).fetchone()
+            if cur is None:
+                raise StaleLease("jeton invalide pour finalisation")
+        row = conn.execute(
+            """
+            SELECT decision, first_selected_attempt FROM campaign_replays
+            WHERE campaign_id=? AND replay_id=?
+            """,
+            (campaign_id, ref.replay_id),
+        ).fetchone()
+        already = bool(row and row["decision"] == "selected")
+        if already:
+            conn.execute(
+                """
+                UPDATE campaign_log_claims SET state='selected'
+                WHERE campaign_id=? AND log_sha256=?
+                """,
+                (campaign_id, ref.log_sha256),
+            )
+            if lease is not None:
+                conn.execute(
+                    """
+                    UPDATE download_tasks SET state='archived', reserved_slot=0
+                    WHERE replay_id=? AND lease_token=?
+                    """,
+                    (lease.task_id, lease.token),
+                )
+            return False
+        first_attempt = attempt_id or (lease.attempt_id if lease else None)
+        conn.execute(
+            """
+            INSERT INTO campaign_replays(
+                campaign_id, replay_id, decision, reason, filter_sha256,
+                version_content_sha256, first_selected_attempt, log_sha256
+            ) VALUES (?, ?, 'selected', 'selected', '', ?, ?, ?)
+            ON CONFLICT(campaign_id, replay_id) DO UPDATE SET
+                decision='selected',
+                version_content_sha256=excluded.version_content_sha256,
+                first_selected_attempt=COALESCE(campaign_replays.first_selected_attempt, excluded.first_selected_attempt),
+                log_sha256=excluded.log_sha256
+            """,
+            (
+                campaign_id,
+                ref.replay_id,
+                ref.content_sha256,
+                first_attempt,
+                ref.log_sha256,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE campaign_log_claims SET state='selected',
+                   replay_id=?, content_sha256=?
+            WHERE campaign_id=? AND log_sha256=?
+            """,
+            (ref.replay_id, ref.content_sha256, campaign_id, ref.log_sha256),
+        )
+        if first_attempt:
+            conn.execute(
+                """
+                UPDATE attempts SET
+                    selected_in_attempt = selected_in_attempt + 1,
+                    reserved_slots = MAX(0, reserved_slots - 1)
+                WHERE attempt_id=?
+                """,
+                (first_attempt,),
+            )
+        if lease is not None:
+            conn.execute(
+                """
+                UPDATE download_tasks SET state='archived', reserved_slot=0,
+                       owner_worker=NULL, lease_token=NULL
+                WHERE replay_id=? AND lease_token=?
+                """,
+                (lease.task_id, lease.token),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE download_tasks SET state='archived', reserved_slot=0,
+                       owner_worker=NULL, lease_token=NULL
+                WHERE replay_id=?
+                """,
+                (ref.replay_id,),
+            )
+        conn.execute(
+            "DELETE FROM publication_intents WHERE replay_id=? AND content_sha256=?",
+            (ref.replay_id, ref.content_sha256),
+        )
+        _ = new_version
+        return True
 
     # --- API consommée par collection_limits ---
 

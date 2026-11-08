@@ -1,0 +1,16 @@
+collection:
+  format_ids:
+    - mc
+  max_selected_replays: 100000
+  max_requests: 200000
+  max_duration_s: 172800
+  requests_per_s: 2
+  discovery_workers: 2
+  download_workers: 8
+  window_days: 25
+  queue_high_water: 10000
+  timeout_s: 30
+  max_attempts: 5
+  lease_duration_s: 120
+  heartbeat_s: 15
+  dataset_recipe_file: dataset-mc-collectable.yaml

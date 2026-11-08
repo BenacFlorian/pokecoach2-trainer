@@ -15,10 +15,10 @@ TEAM_A = ["pikachu", "eevee", "bulbasaur", "charmander", "squirtle", "mew"]
 
 
 def _log_pokes(p1: list[str], p2: list[str]) -> str:
-    lines = ["|player|p1|A|1300|", "|player|p2|B|1300|"]
+    lines = ["|player|p1|A|av1|1300|", "|player|p2|B|av2|1300|"]
     for side, roster in (("p1", p1), ("p2", p2)):
-        for slot, species in zip("abcdef", roster, strict=True):
-            lines.append(f"|poke|{side}{slot}|{species}|")
+        for species in roster:
+            lines.append(f"|poke|{side}|{species}, L50|")
     lines.append("|turn|1|")
     return "\n".join(lines) + "\n"
 
@@ -43,7 +43,7 @@ def test_match_p1_or_p2_ignores_order_and_sets():
 def test_unknown_other_side_does_not_cancel_known_match():
     team = TeamFilter(teams=[TEAM_A])
     cfg = CollectionConfig(format_ids=["mc"], team_filter=team)
-    log = "|player|p1|A||\n|poke|p1a|pikachu|\n|poke|p1b|eevee|\n|turn|1|\n"
+    log = "|player|p1|A|av||\n|poke|p1|pikachu, L50|\n|poke|p1b|eevee|\n|turn|1|\n"
     summary = extract_team_summary({"id": "x", "log": log, "format": "f"})
     assert summary.p1 is None
     decision = evaluate_selection(cfg, uploadtime=1, summary=summary)
@@ -53,11 +53,11 @@ def test_unknown_other_side_does_not_cancel_known_match():
 def test_four_revealed_pokemon_are_not_a_team():
     log = "\n".join(
         [
-            "|player|p1|A||",
-            "|poke|p1a|pikachu|",
-            "|poke|p1b|eevee|",
-            "|poke|p1c|bulbasaur|",
-            "|poke|p1d|charmander|",
+            "|player|p1|A|av||",
+            "|poke|p1|pikachu, L50|",
+            "|poke|p1|eevee, L50|",
+            "|poke|p1|bulbasaur, L50|",
+            "|poke|p1|charmander, L50|",
             "|turn|1|",
         ]
     )

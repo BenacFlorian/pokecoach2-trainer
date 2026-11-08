@@ -4,25 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Any
 
-from pokecoach_trainer.schemas import CollectionConfig, TeamFilter
+from pokecoach_trainer.collection_types import CollectionEvaluation, SelectionDecision, TeamSummary
+from pokecoach_trainer.replay_log import preview_team_tuple
+from pokecoach_trainer.schemas import ArchiveRef, CollectionConfig, TeamFilter
 from pokecoach_trainer.storage import canonical_json_sha256
 
-from pokecoach_trainer.collection_types import SelectionDecision, TeamSummary
-
-_PARSER_VERSION = "collection_filters/1"
-_POKE_LINE = re.compile(r"^\|poke\|(p[12][a-f])\|([^|]*)\|")
-_PREVIEW_END = re.compile(r"^\|(turn|move|switch|upkeep)\|")
-
-
-def _normalize_species(raw: str) -> str | None:
-    slug = raw.strip().lower().replace(" ", "").replace("-", "")
-    if not slug or not re.fullmatch(r"[a-z0-9]+", slug):
-        return None
-    return slug
+_PARSER_VERSION = "collection_filters/2"
 
 
 def load_team_filter(path: Path) -> TeamFilter:
@@ -35,13 +25,27 @@ def load_team_filter(path: Path) -> TeamFilter:
 
 
 def filter_fingerprint(config: CollectionConfig) -> str:
-    """Empreinte des filtres utilisateur actifs."""
+    """Empreinte des filtres utilisateur actifs (date/équipe + profil dataset éventuel)."""
 
-    payload = {
-        "upload_after": config.upload_after.isoformat() if config.upload_after else None,
-        "upload_before": config.upload_before.isoformat() if config.upload_before else None,
-        "team_filter": config.team_filter.model_dump(mode="json") if config.team_filter else None,
-    }
+    if config.dataset_filters is None:
+        payload = {
+            "upload_after": config.upload_after.isoformat() if config.upload_after else None,
+            "upload_before": config.upload_before.isoformat() if config.upload_before else None,
+            "team_filter": (
+                config.team_filter.model_dump(mode="json") if config.team_filter else None
+            ),
+        }
+    else:
+        from pokecoach_trainer.replay_policy import replay_filter_fingerprint
+
+        payload = {
+            "business": replay_filter_fingerprint(config.dataset_filters),
+            "upload_after": config.upload_after.isoformat() if config.upload_after else None,
+            "upload_before": config.upload_before.isoformat() if config.upload_before else None,
+            "team_filter": (
+                config.team_filter.model_dump(mode="json") if config.team_filter else None
+            ),
+        }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -59,34 +63,11 @@ def extract_team_summary(payload: dict[str, Any]) -> TeamSummary:
             p1=None, p2=None, parser_version=_PARSER_VERSION, content_sha256=content_sha256
         )
     lines = log.splitlines()
-    preview: list[str] = []
-    for line in lines:
-        if _PREVIEW_END.match(line):
-            break
-        preview.append(line)
-
-    def side_team(side: str) -> tuple[str, ...] | None:
-        slots = {f"{side}{letter}": None for letter in "abcdef"}
-        for line in preview:
-            match = _POKE_LINE.match(line)
-            if not match:
-                continue
-            slot, body = match.group(1), match.group(2)
-            if not slot.startswith(side):
-                continue
-            if slot not in slots:
-                continue
-            species = _normalize_species(body.split(",")[0])
-            if species is None:
-                return None
-            slots[slot] = species
-        if any(v is None for v in slots.values()):
-            return None
-        return tuple(sorted(slots.values()))
-
+    p1 = preview_team_tuple(lines, "p1")
+    p2 = preview_team_tuple(lines, "p2")
     return TeamSummary(
-        p1=side_team("p1"),
-        p2=side_team("p2"),
+        p1=p1,
+        p2=p2,
         parser_version=_PARSER_VERSION,
         content_sha256=content_sha256,
     )
@@ -129,3 +110,49 @@ def evaluate_selection(
     if summary.p1 is None or summary.p2 is None:
         return SelectionDecision(selected=False, reason="team_unknown", filter_sha256=fp)
     return SelectionDecision(selected=False, reason="team_mismatch", filter_sha256=fp)
+
+
+def evaluate_collection_candidate(
+    config: CollectionConfig,
+    ref: ArchiveRef,
+    envelope: dict[str, Any],
+) -> CollectionEvaluation:
+    """Date/équipe puis politique dataset (sans I/O)."""
+
+    from pokecoach_trainer.replay_metadata import extract_replay_metadata
+    from pokecoach_trainer.replay_policy import evaluate_replay_policy
+
+    provider = envelope.get("provider") or {}
+    summary = extract_team_summary(provider)
+    uploadtime = provider.get("uploadtime")
+    ts = int(uploadtime) if uploadtime is not None else None
+    date_decision = evaluate_selection(config, uploadtime=ts, summary=summary)
+    if not date_decision.selected:
+        return CollectionEvaluation(
+            selection=date_decision, metadata=None, eligibility=None, summary=summary
+        )
+    meta = extract_replay_metadata(ref, cached=envelope)
+    if config.dataset_filters is None:
+        return CollectionEvaluation(
+            selection=date_decision, metadata=meta, eligibility=None, summary=summary
+        )
+    eligibility = evaluate_replay_policy(meta, config.dataset_filters)
+    if not eligibility.accepted:
+        return CollectionEvaluation(
+            selection=SelectionDecision(
+                selected=False,
+                reason=eligibility.reason_code,
+                filter_sha256=date_decision.filter_sha256,
+            ),
+            metadata=meta,
+            eligibility=eligibility,
+            summary=summary,
+        )
+    return CollectionEvaluation(
+        selection=SelectionDecision(
+            selected=True, reason="selected", filter_sha256=date_decision.filter_sha256
+        ),
+        metadata=meta,
+        eligibility=eligibility,
+        summary=summary,
+    )

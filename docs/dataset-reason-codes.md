@@ -26,11 +26,15 @@ Les filtres émettent des `FilterDecision` ; l'archive brute n'est jamais modifi
 | `elo_unknown` | Rating individuel absent |
 | `elo_unknown_no_individual` | Seul un rating moyen est disponible |
 | `only_winners_loser` | Perdant exclu car `only_winners=true` |
+| `winner_unknown` | `only_winners=true` mais gagnant ou identité du côté absents |
+| `no_eligible_perspective` | Partie OK mais aucun côté admissible (Elo, etc.) |
 
 ## Sélection et conversion
 
 | Code | Signification |
 | --- | --- |
+| `duplicate_log` | Même `log_sha256` déjà retenu (campagne ou dataset `deduplicate`) |
+| `invalid_replay_payload` | Payload Showdown illisible / hors périmètre |
 | `not_selected_target_reached` | Candidat non traité après atteinte de la cible |
 | `conversion_empty` | Convertisseur sans trajectoire |
 | `conversion_exception` | Erreur technique de conversion |

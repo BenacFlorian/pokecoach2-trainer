@@ -38,9 +38,9 @@ def _provider_canonical(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: payload[k] for k in _PROVIDER_KEYS if k in payload}
 
 
-def prepare_replay(
-    root: Path, replay_id: str, payload: dict[str, Any], source: ArchiveSource
-) -> PreparedReplay:
+def build_replay_envelope(
+    replay_id: str, payload: dict[str, Any], source: ArchiveSource
+) -> tuple[ArchiveRef, dict[str, Any]]:
     if payload.get("id") != replay_id:
         raise InvalidConfiguration("identifiant replay incohérent")
     if not is_champions_vgc_2026_replay_id(replay_id):
@@ -76,6 +76,13 @@ def prepare_replay(
         "archive_ref": ref.model_dump(mode="json"),
         "conflict": False,
     }
+    return ref, envelope
+
+
+def prepare_replay(
+    root: Path, replay_id: str, payload: dict[str, Any], source: ArchiveSource
+) -> PreparedReplay:
+    ref, envelope = build_replay_envelope(replay_id, payload, source)
     staging = root / "archive" / "staging"
     staging.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=staging, suffix=".json.tmp")
@@ -100,6 +107,8 @@ def publish_replay(
     if not temp_path.is_file() and not final_path.is_file():
         raise InvalidConfiguration("fichier temporaire de publication absent")
     if catalog_has_replay(root, prepared.ref.replay_id, prepared.ref.content_sha256):
+        if lease is not None:
+            store.finalize_selection(lease, prepared.ref, new_version=False)
         return PublicationResult(ref=prepared.ref, new_replay=False, new_version=False)
     hook = _PUBLICATION_HOOKS.get("before_intent")
     if callable(hook):
@@ -128,7 +137,16 @@ def publish_replay(
                 lease.token if lease else None,
                 prepared.temp_relpath,
                 prepared.ref.object_relpath,
-                json.dumps(prepared.envelope, sort_keys=True),
+                json.dumps(
+                    {
+                        "envelope": prepared.envelope,
+                        "collection": {
+                            "campaign_id": lease.campaign_id if lease else None,
+                            "attempt_id": lease.attempt_id if lease else None,
+                        },
+                    },
+                    sort_keys=True,
+                ),
             ),
         )
     final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,16 +202,32 @@ def publish_replay(
                 "conflict": ref.conflict,
             },
         )
+    hook = _PUBLICATION_HOOKS.get("after_catalog_before_finalize")
+    if callable(hook):
+        hook()
     with store._tx() as conn:
-        conn.execute("DELETE FROM publication_intents WHERE intent_id=?", (intent_id,))
+        filtered = False
         if lease is not None:
-            conn.execute(
-                """
-                UPDATE download_tasks SET state='archived', reserved_slot=0
-                WHERE replay_id=? AND lease_token=?
-                """,
-                (lease.replay_id, lease.token),
-            )
+            camp = conn.execute(
+                "SELECT effective_config_json FROM campaigns WHERE campaign_id=?",
+                (lease.campaign_id,),
+            ).fetchone()
+            if camp is not None:
+                from pokecoach_trainer.schemas import CollectionConfig
+
+                cfg = CollectionConfig.model_validate_json(camp["effective_config_json"])
+                filtered = cfg.dataset_filters is not None
+        if lease is None or not filtered:
+            conn.execute("DELETE FROM publication_intents WHERE intent_id=?", (intent_id,))
+            if lease is not None:
+                conn.execute(
+                    """
+                    UPDATE download_tasks SET state='archived', reserved_slot=0
+                    WHERE replay_id=? AND lease_token=?
+                    """,
+                    (lease.replay_id, lease.token),
+                )
+        if lease is not None:
             conn.execute(
                 "UPDATE attempts SET new_published = new_published + ? WHERE attempt_id=?",
                 (1 if new_version else 0, lease.attempt_id),
@@ -213,26 +247,75 @@ def recover_publications(store: CollectionStore, *, limit: int = 100) -> int:
     for row in rows:
         final_path = root / "archive" / row["final_relpath"]
         temp_path = root / "archive" / row["temp_relpath"]
+        if not final_path.is_file() and temp_path.is_file():
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temp_path, final_path)
         if final_path.is_file():
             metadata = json.loads(row["metadata_json"])
-            ref = ArchiveRef.model_validate(metadata["archive_ref"])
-            source = ArchiveSource.model_validate(metadata["source"])
-            if not catalog_has_replay(root, ref.replay_id, ref.content_sha256):
+            envelope = metadata.get("envelope") if "archive_ref" not in metadata else metadata
+            if envelope is None:
+                envelope = metadata
+            ref = ArchiveRef.model_validate(envelope["archive_ref"])
+            source = ArchiveSource.model_validate(envelope["source"])
+            new_version = not catalog_has_replay(root, ref.replay_id, ref.content_sha256)
+            if new_version:
                 insert_replay_version(
                     root, ref=ref, source=source, provider_format=ref.format_id
+                )
+            collection = metadata.get("collection") or {}
+            campaign_id = collection.get("campaign_id")
+            attempt_id = collection.get("attempt_id")
+            if campaign_id:
+                store.finalize_recovered_publication(
+                    campaign_id=campaign_id,
+                    attempt_id=attempt_id,
+                    ref=ref,
+                    new_version=new_version,
                 )
             with store._tx() as conn:
                 conn.execute(
                     "DELETE FROM publication_intents WHERE intent_id=?", (row["intent_id"],)
                 )
-            recovered += 1
-        elif temp_path.is_file():
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(temp_path, final_path)
             recovered += 1
         else:
             with store._tx() as conn:
                 conn.execute(
                     "DELETE FROM publication_intents WHERE intent_id=?", (row["intent_id"],)
                 )
+    recovered += _recover_pending_publications(store, limit=limit)
+    return recovered
+
+
+def _recover_pending_publications(store: CollectionStore, *, limit: int) -> int:
+    recovered = 0
+    with catalog_connection(store._root) as conn:
+        rows = conn.execute(
+            """
+            SELECT cr.campaign_id, cr.replay_id, cr.version_content_sha256, cr.log_sha256,
+                   c.attempt_id, rv.object_relpath, rv.provider_format
+            FROM campaign_replays cr
+            JOIN campaigns c ON c.campaign_id = cr.campaign_id
+            JOIN replay_versions rv
+              ON rv.replay_id = cr.replay_id
+             AND rv.content_sha256 = cr.version_content_sha256
+            WHERE cr.decision = 'pending_publication'
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    for row in rows:
+        ref = ArchiveRef(
+            replay_id=row["replay_id"],
+            content_sha256=row["version_content_sha256"],
+            log_sha256=row["log_sha256"] or "",
+            format_id=row["provider_format"] or "",
+            object_relpath=row["object_relpath"],
+        )
+        if store.finalize_recovered_publication(
+            campaign_id=row["campaign_id"],
+            attempt_id=row["attempt_id"],
+            ref=ref,
+            new_version=False,
+        ):
+            recovered += 1
     return recovered

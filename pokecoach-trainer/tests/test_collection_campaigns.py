@@ -145,7 +145,7 @@ def test_new_filter_revisits_prior_rejections_without_rediscovery(store_root):
         ).fetchone()
     assert windows_after == windows_before
     assert task["state"] == "pending"
-    assert row["decision"] == "selected"
+    assert row is None
 
 
 def test_modified_team_file_does_not_change_resume(store_root):

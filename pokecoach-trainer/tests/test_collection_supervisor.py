@@ -78,6 +78,9 @@ def test_api_exit_does_not_release_child_lock(tmp_path, monkeypatch):
     ) as get_job, mock.patch(
         "pokecoach_trainer.collection_supervisor.save_job"
     ), mock.patch(
+        "pokecoach_trainer.collection_supervisor.collection_progress",
+        return_value={},
+    ), mock.patch(
         "pokecoach_trainer.collection_supervisor.CollectionStore"
     ) as store_cls:
         store = store_cls.return_value

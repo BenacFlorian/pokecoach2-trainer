@@ -54,6 +54,8 @@ def collection_request_fingerprint(config: CollectionConfig) -> str:
     """Empreinte stable de la requête utilisateur (sans borne technique figée)."""
 
     payload = config.model_dump(mode="json", exclude={"effective_upload_before"})
+    if config.dataset_filters is None:
+        payload.pop("dataset_filters", None)
     if config.upload_before is None:
         payload["upload_before"] = None
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -146,8 +148,11 @@ def collect_replays(
     """
     Collecte incrémentale avec budgets, reprise et journalisation.
 
-    Ne filtre aucun replay sur critères métier dataset.
+    Ne filtre aucun replay sur critères métier dataset (sauf profil dataset → utiliser submit_collection).
     """
+
+    if config.dataset_filters is not None:
+        raise InvalidConfiguration("les filtres dataset nécessitent la collecte supervisée")
 
     import time
 

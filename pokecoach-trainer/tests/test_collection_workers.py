@@ -96,10 +96,10 @@ TEAM_A = ["pikachu", "eevee", "bulbasaur", "charmander", "squirtle", "mew"]
 
 
 def _log(p1: list[str], p2: list[str]) -> str:
-    lines = ["|player|p1|A|1300|", "|player|p2|B|1300|"]
+    lines = ["|player|p1|A|av1|1300|", "|player|p2|B|av2|1300|"]
     for side, roster in (("p1", p1), ("p2", p2)):
-        for slot, species in zip("abcdef", roster, strict=True):
-            lines.append(f"|poke|{side}{slot}|{species}|")
+        for species in roster:
+            lines.append(f"|poke|{side}|{species}, L50|")
     lines.append("|turn|1|")
     return "\n".join(lines) + "\n"
 
@@ -413,3 +413,436 @@ def test_new_team_filter_uses_cached_summary_without_get_for_known_mismatch(env)
     second = store.start_campaign(mc_config(max_selected_replays=5, team_filter=team))
     claim = store.claim_download(second.job.job_id, "w1")
     assert claim.lease is None
+
+
+def test_filtered_campaign_keeps_only_valid_payload(env):
+    from pokecoach_trainer.archive_catalog import catalog_connection
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+    from replay_log_fixtures import build_log
+
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    view = store.start_campaign(
+        mc_config(max_selected_replays=5, dataset_filters=ReplayFilterConfig())
+    )
+    ids = {
+        "ots": f"{SOURCE}-noots",
+        "elo": f"{SOURCE}-elo",
+        "inact": f"{SOURCE}-inact",
+        "ok": f"{SOURCE}-ok",
+    }
+    store.enqueue_replays(
+        view.job.job_id,
+        [SearchItem(replay_id=rid, uploadtime=1, source_format=SOURCE) for rid in ids.values()],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        rid = request.url.path.split("/")[-1].replace(".json", "")
+        if rid.endswith("noots"):
+            log = build_log(include_ots=False, p1_rating=1300, p2_rating=1300)
+        elif rid.endswith("elo"):
+            log = build_log(p1_rating=900, p2_rating=900)
+        elif rid.endswith("inact"):
+            log = build_log(p1_rating=1300, p2_rating=1300, termination="inactivity")
+        else:
+            log = build_log(p1_rating=1300, p2_rating=900)
+        return httpx.Response(200, json={"id": rid, "uploadtime": 1, "log": log, "format": SOURCE})
+
+    client = ShowdownReplayClient(transport=httpx.MockTransport(handler), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        view.job.job_id,
+        "dl-valid",
+        "download",
+        client_factory=lambda _c: client,
+        sleep=tick(clock),
+        max_steps=4,
+        clock=clock,
+    )
+    assert is_replay_archived(ids["ok"])
+    assert not is_replay_archived(ids["ots"])
+    assert not is_replay_archived(ids["elo"])
+    assert not is_replay_archived(ids["inact"])
+    with catalog_connection(env) as conn:
+        selected = conn.execute(
+            "SELECT COUNT(*) AS n FROM campaign_replays WHERE campaign_id=? AND decision='selected'",
+            (view.job.job_id,),
+        ).fetchone()["n"]
+        rejected = conn.execute(
+            "SELECT COUNT(*) AS n FROM campaign_replays WHERE campaign_id=? AND decision='rejected'",
+            (view.job.job_id,),
+        ).fetchone()["n"]
+    assert selected == 1
+    assert rejected == 3
+    client.close()
+
+
+def test_filtered_reject_has_no_staging(env):
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+    from replay_log_fixtures import build_log
+
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    view = store.start_campaign(
+        mc_config(max_selected_replays=5, dataset_filters=ReplayFilterConfig())
+    )
+    rid = f"{SOURCE}-rejstage"
+    store.enqueue_replays(view.job.job_id, [SearchItem(rid, 1, SOURCE)])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": rid,
+                "uploadtime": 1,
+                "log": build_log(include_ots=False),
+                "format": SOURCE,
+            },
+        )
+
+    client = ShowdownReplayClient(transport=httpx.MockTransport(handler), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        view.job.job_id,
+        "dl-rej",
+        "download",
+        client_factory=lambda _c: client,
+        sleep=tick(clock),
+        max_steps=1,
+        clock=clock,
+    )
+    staging = env / "archive" / "staging"
+    leftover = list(staging.glob("*")) if staging.is_dir() else []
+    assert leftover == []
+    assert not is_replay_archived(rid)
+    client.close()
+
+
+def test_invalid_payload_is_permanent_reject(env):
+    from pokecoach_trainer.archive_catalog import catalog_connection
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    view = store.start_campaign(
+        mc_config(max_selected_replays=5, dataset_filters=ReplayFilterConfig())
+    )
+    rid = f"{SOURCE}-badjson"
+    store.enqueue_replays(view.job.job_id, [SearchItem(rid, 1, SOURCE)])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": rid, "uploadtime": 1, "log": "", "format": SOURCE})
+
+    client = ShowdownReplayClient(transport=httpx.MockTransport(handler), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        view.job.job_id,
+        "dl-bad",
+        "download",
+        client_factory=lambda _c: client,
+        sleep=tick(clock),
+        max_steps=1,
+        clock=clock,
+    )
+    with catalog_connection(env) as conn:
+        row = conn.execute(
+            "SELECT decision, reason FROM campaign_replays WHERE replay_id=?",
+            (rid,),
+        ).fetchone()
+    assert row["decision"] == "rejected"
+    assert row["reason"] == "invalid_replay_payload"
+    assert store.get_campaign(view.job.job_id).counters["selected_in_attempt"] == 0
+    client.close()
+
+
+def test_admission_internal_error_is_not_business_reject(env, monkeypatch):
+    from pokecoach_trainer.archive_catalog import catalog_connection
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+    from replay_log_fixtures import build_log
+
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    view = store.start_campaign(
+        mc_config(max_selected_replays=5, dataset_filters=ReplayFilterConfig())
+    )
+    rid = f"{SOURCE}-boom"
+    store.enqueue_replays(view.job.job_id, [SearchItem(rid, 1, SOURCE)])
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(
+        "pokecoach_trainer.collection_workers.evaluate_collection_candidate", boom
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": rid, "uploadtime": 1, "log": build_log(), "format": SOURCE},
+        )
+
+    client = ShowdownReplayClient(transport=httpx.MockTransport(handler), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        view.job.job_id,
+        "dl-boom",
+        "download",
+        client_factory=lambda _c: client,
+        sleep=tick(clock),
+        max_steps=1,
+        clock=clock,
+    )
+    with catalog_connection(env) as conn:
+        rejected = conn.execute(
+            "SELECT COUNT(*) AS n FROM campaign_replays WHERE reason != 'invalid_replay_payload'"
+        ).fetchone()["n"]
+        state = conn.execute(
+            "SELECT state, last_error FROM download_tasks WHERE replay_id=?", (rid,)
+        ).fetchone()
+    assert rejected == 0
+    assert state["state"] in {"retry_wait", "failed", "pending"}
+    assert store.get_campaign(view.job.job_id).counters["selected_in_attempt"] == 0
+    client.close()
+
+
+def test_archived_valid_and_invalid_need_no_http(env):
+    from pokecoach_trainer.archive_catalog import catalog_connection
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+    from replay_log_fixtures import build_log
+
+    source = ArchiveSource(provenance="t", fetched_at=datetime.now(timezone.utc))
+    ok = f"{SOURCE}-locok"
+    bad = f"{SOURCE}-locbad"
+    archive_replay(
+        ok,
+        {"id": ok, "uploadtime": 1, "log": build_log(p1_rating=1300, p2_rating=900), "format": SOURCE},
+        source,
+    )
+    archive_replay(
+        bad,
+        {
+            "id": bad,
+            "uploadtime": 1,
+            "log": build_log(include_ots=False, p1_rating=1300, p2_rating=1300),
+            "format": SOURCE,
+        },
+        source,
+    )
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    view = store.start_campaign(
+        mc_config(max_selected_replays=5, dataset_filters=ReplayFilterConfig())
+    )
+    store.enqueue_replays(
+        view.job.job_id,
+        [SearchItem(ok, 1, SOURCE), SearchItem(bad, 1, SOURCE)],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("aucun HTTP attendu")
+
+    client = ShowdownReplayClient(transport=httpx.MockTransport(handler), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        view.job.job_id,
+        "dl-local",
+        "download",
+        client_factory=lambda _c: client,
+        sleep=tick(clock),
+        max_steps=2,
+        clock=clock,
+    )
+    campaign = store.get_campaign(view.job.job_id)
+    assert campaign.counters["selected_in_attempt"] == 1
+    assert campaign.counters["new_published"] == 0
+    with catalog_connection(env) as conn:
+        selected = conn.execute(
+            "SELECT replay_id FROM campaign_replays WHERE decision='selected'"
+        ).fetchone()
+        rejected = conn.execute(
+            "SELECT replay_id FROM campaign_replays WHERE decision='rejected'"
+        ).fetchone()
+    assert selected["replay_id"] == ok
+    assert rejected["replay_id"] == bad
+    client.close()
+
+
+def test_old_parser_cache_still_reads_local_archive(env):
+    from pokecoach_trainer.replay_metadata import REPLAY_METADATA_VERSION
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+    from replay_log_fixtures import build_log
+
+    source = ArchiveSource(provenance="t", fetched_at=datetime.now(timezone.utc))
+    rid = f"{SOURCE}-oldcache"
+    ref = archive_replay(
+        rid,
+        {"id": rid, "uploadtime": 1, "log": build_log(p1_rating=1300, p2_rating=900), "format": SOURCE},
+        source,
+    )
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    with store._tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO replay_metadata_cache(
+                replay_id, content_sha256, parser_version, log_sha256,
+                source_format, uploadtime, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (rid, ref.content_sha256, "replay_metadata/1", ref.log_sha256, SOURCE, 1, "{}"),
+        )
+    view = store.start_campaign(
+        mc_config(max_selected_replays=5, dataset_filters=ReplayFilterConfig())
+    )
+    store.enqueue_replays(view.job.job_id, [SearchItem(rid, 1, SOURCE)])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("aucun HTTP attendu")
+
+    client = ShowdownReplayClient(transport=httpx.MockTransport(handler), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        view.job.job_id,
+        "dl-oldc",
+        "download",
+        client_factory=lambda _c: client,
+        sleep=tick(clock),
+        max_steps=1,
+        clock=clock,
+    )
+    assert store.get_campaign(view.job.job_id).counters["selected_in_attempt"] == 1
+    cached = store.get_cached_metadata(ref)
+    assert cached is not None
+    assert cached.parser_version == REPLAY_METADATA_VERSION
+    client.close()
+
+
+def test_same_profile_ots_reject_does_not_refetch(env):
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+    from replay_log_fixtures import build_log
+
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    filters = ReplayFilterConfig()
+    view = store.start_campaign(mc_config(max_selected_replays=5, dataset_filters=filters))
+    rid = f"{SOURCE}-otsagain"
+    store.enqueue_replays(view.job.job_id, [SearchItem(rid, 1, SOURCE)])
+    fetches = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fetches.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"id": rid, "uploadtime": 1, "log": build_log(include_ots=False), "format": SOURCE},
+        )
+
+    client = ShowdownReplayClient(transport=httpx.MockTransport(handler), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        view.job.job_id,
+        "dl-ots1",
+        "download",
+        client_factory=lambda _c: client,
+        sleep=tick(clock),
+        max_steps=1,
+        clock=clock,
+    )
+    assert fetches
+    claim = store.claim_download(view.job.job_id, "w2")
+    assert claim.lease is None
+    client.close()
+
+
+def test_new_profile_without_body_refetches(env):
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+    from replay_log_fixtures import build_log
+
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    first = store.start_campaign(
+        mc_config(max_selected_replays=5, dataset_filters=ReplayFilterConfig())
+    )
+    rid = f"{SOURCE}-reots"
+    store.enqueue_replays(first.job.job_id, [SearchItem(rid, 1, SOURCE)])
+
+    def handler_first(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": rid,
+                "uploadtime": 1,
+                "log": build_log(include_ots=False, p1_rating=1300, p2_rating=1300),
+                "format": SOURCE,
+            },
+        )
+
+    client = ShowdownReplayClient(transport=httpx.MockTransport(handler_first), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        first.job.job_id,
+        "dl-first",
+        "download",
+        client_factory=lambda _c: client,
+        sleep=tick(clock),
+        max_steps=1,
+        clock=clock,
+    )
+    store.command(first.job.job_id, "stop")
+    fetches = []
+
+    def handler_second(request: httpx.Request) -> httpx.Response:
+        fetches.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "id": rid,
+                "uploadtime": 1,
+                "log": build_log(include_ots=False, p1_rating=1300, p2_rating=1300),
+                "format": SOURCE,
+            },
+        )
+
+    second = store.start_campaign(
+        mc_config(
+            max_selected_replays=5,
+            dataset_filters=ReplayFilterConfig(require_ots=False),
+        )
+    )
+    client2 = ShowdownReplayClient(transport=httpx.MockTransport(handler_second), sleep=lambda _: None)
+    run_collection_worker(
+        env,
+        second.job.job_id,
+        "dl-second",
+        "download",
+        client_factory=lambda _c: client2,
+        sleep=tick(clock),
+        max_steps=1,
+        clock=clock,
+    )
+    assert fetches
+    assert is_replay_archived(rid)
+    assert store.get_campaign(second.job.job_id).counters["selected_in_attempt"] == 1
+    client.close()
+    client2.close()
+
+
+def test_other_format_backlog_is_not_claimed(env):
+    from pokecoach_trainer.schemas import ReplayFilterConfig
+
+    clock = FakeClock()
+    store = CollectionStore(env, clock=clock)
+    view = store.start_campaign(
+        mc_config(max_selected_replays=5, dataset_filters=ReplayFilterConfig())
+    )
+    other = "gen9vgc2026regfbo3-otherfmt"
+    mine = f"{SOURCE}-minefmt"
+    store.enqueue_replays(
+        view.job.job_id,
+        [
+            SearchItem(other, 1, "gen9vgc2026regfbo3"),
+            SearchItem(mine, 1, SOURCE),
+        ],
+    )
+    claim = store.claim_download(view.job.job_id, "w1")
+    assert claim.lease is not None
+    assert claim.lease.replay_id == mine

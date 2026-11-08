@@ -101,14 +101,16 @@ class TeamSummary:
 @dataclass(frozen=True, slots=True)
 class SelectionDecision:
     selected: bool
-    reason: Literal[
-        "selected",
-        "team_mismatch",
-        "team_unknown",
-        "outside_period",
-        "date_unknown",
-    ]
+    reason: str
     filter_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionEvaluation:
+    selection: SelectionDecision
+    metadata: Any | None
+    eligibility: Any | None
+    summary: TeamSummary | None
 
 
 @dataclass(frozen=True, slots=True)

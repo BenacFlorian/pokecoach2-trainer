@@ -4,7 +4,7 @@ import pytest
 from pokecoach_trainer.collection_client import ShowdownReplayClient
 from pokecoach_trainer.collection_service import collect_replays
 from pokecoach_trainer.errors import InvalidConfiguration, ProviderInvalidPayload, ProviderRateLimited
-from pokecoach_trainer.schemas import CollectionConfig
+from pokecoach_trainer.schemas import CollectionConfig, ReplayFilterConfig
 from pokecoach_trainer.settings import clear_settings_cache, ensure_storage_layout
 
 SOURCE_FORMAT = "gen9championsvgc2026regmc"
@@ -130,3 +130,13 @@ def test_client_single_attempt_on_429(collection_env):
         client.fetch(REPLAY_ID)
     assert client.request_count == 1
     client.close()
+
+
+def test_collect_replays_refuses_dataset_filters(collection_env):
+    config = CollectionConfig(
+        format_ids=["mc"],
+        max_new_replays=1,
+        dataset_filters=ReplayFilterConfig(),
+    )
+    with pytest.raises(InvalidConfiguration, match="collecte supervisée"):
+        collect_replays(config, "job-filtered")

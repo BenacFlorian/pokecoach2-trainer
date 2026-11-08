@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pokecoach_trainer.archive_catalog import catalog_connection
+from pokecoach_trainer.collection_filters import filter_fingerprint
 from pokecoach_trainer.collection_store import CollectionStore
 
 
@@ -27,10 +29,24 @@ def collection_progress(store: CollectionStore, campaign_id: str) -> dict[str, A
             """,
             (campaign_id,),
         ).fetchall()
-        selected = conn.execute(
+        selected_rows = conn.execute(
+            """
+            SELECT decision_json FROM campaign_replays
+            WHERE campaign_id=? AND decision='selected'
+            """,
+            (campaign_id,),
+        ).fetchall()
+        duplicates = conn.execute(
             """
             SELECT COUNT(*) AS n FROM campaign_replays
-            WHERE campaign_id=? AND decision='selected'
+            WHERE campaign_id=? AND decision='rejected' AND reason='duplicate_log'
+            """,
+            (campaign_id,),
+        ).fetchone()["n"]
+        validation_pending = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM campaign_replays
+            WHERE campaign_id=? AND decision='pending_publication'
             """,
             (campaign_id,),
         ).fetchone()["n"]
@@ -45,15 +61,28 @@ def collection_progress(store: CollectionStore, campaign_id: str) -> dict[str, A
         attempt = conn.execute(
             "SELECT * FROM attempts WHERE attempt_id=?", (view.attempt_id,)
         ).fetchone()
+    accepted_perspectives = 0
+    for row in selected_rows:
+        if not row["decision_json"]:
+            continue
+        try:
+            payload = json.loads(row["decision_json"])
+        except json.JSONDecodeError:
+            continue
+        accepted_perspectives += len(payload.get("accepted_sides") or [])
     return {
         "phase": view.phase,
         "coverage_incomplete": view.coverage_incomplete,
+        "filter_sha256": filter_fingerprint(view.effective_config),
         "counters": {
             **view.counters,
-            "selected_replays": int(selected),
+            "selected_replays": len(selected_rows),
             "pending_downloads": int(pending),
             "requests_consumed": int(attempt["requests_consumed"]) if attempt else 0,
             "new_published": int(attempt["new_published"]) if attempt else 0,
+            "accepted_perspectives": accepted_perspectives,
+            "duplicate_replays": int(duplicates),
+            "validation_pending": int(validation_pending),
         },
         "rejected_by_reason": {row["reason"]: int(row["n"]) for row in rejected},
         "discovery_windows_open": int(windows_open),

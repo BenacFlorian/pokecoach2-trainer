@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pokecoach_trainer.schemas import DatasetRecipe, FilterDecision, FilterStage, ReplayMetadata
+from pokecoach_trainer.schemas import DatasetRecipe, FilterDecision, FilterStage, ReplayFilterConfig, ReplayMetadata
 
 
 def _rating_for_side(meta: ReplayMetadata, side: str) -> int | None:
@@ -13,7 +13,7 @@ def _username_for_side(meta: ReplayMetadata, side: str) -> str | None:
     return meta.p1_username if side == "p1" else meta.p2_username
 
 
-def decide_game(meta: ReplayMetadata, recipe: DatasetRecipe) -> FilterDecision:
+def decide_game(meta: ReplayMetadata, recipe: ReplayFilterConfig) -> FilterDecision:
     """Décision au niveau partie (format, fin, OTS, équipes, BO)."""
 
     base = dict(replay_id=meta.replay_id, player_side=None, sources=["replay_metadata"])
@@ -107,7 +107,7 @@ def decide_game(meta: ReplayMetadata, recipe: DatasetRecipe) -> FilterDecision:
     )
 
 
-def decide_perspective(meta: ReplayMetadata, side: str, recipe: DatasetRecipe) -> FilterDecision:
+def decide_perspective(meta: ReplayMetadata, side: str, recipe: ReplayFilterConfig) -> FilterDecision:
     """Décision au niveau perspective (Elo individuel, gagnant seulement)."""
 
     game = decide_game(meta, recipe)
@@ -151,7 +151,15 @@ def decide_perspective(meta: ReplayMetadata, side: str, recipe: DatasetRecipe) -
             )
     if recipe.only_winners:
         username = _username_for_side(meta, side)
-        if meta.winner and username and meta.winner != username:
+        if not meta.winner or not username:
+            return FilterDecision(
+                accepted=False,
+                stage=FilterStage.perspective,
+                reason_code="winner_unknown",
+                details={"winner": meta.winner, "username": username},
+                **base,
+            )
+        if meta.winner != username:
             return FilterDecision(
                 accepted=False,
                 stage=FilterStage.perspective,

@@ -16,7 +16,7 @@ from pokecoach_trainer.errors import Conflict, StorageIncompatible
 from pokecoach_trainer.schemas import ArchiveRef, ArchiveSource
 from pokecoach_trainer.storage import read_json
 
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
 CATALOG_FILENAME = "catalog.sqlite3"
 MAINTENANCE_LOCK = ".maintenance.lock"
 _OBJECTS_DIR = "objects"
@@ -224,6 +224,34 @@ CREATE TABLE IF NOT EXISTS metric_buckets (
 );
 """
 
+_MIGRATE_V1_TO_V2 = """
+ALTER TABLE campaigns ADD COLUMN validation_parser_version TEXT;
+ALTER TABLE campaigns ADD COLUMN validation_policy_version TEXT;
+ALTER TABLE campaign_replays ADD COLUMN decision_json TEXT;
+ALTER TABLE campaign_replays ADD COLUMN log_sha256 TEXT;
+
+CREATE TABLE IF NOT EXISTS replay_metadata_cache (
+    replay_id TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    log_sha256 TEXT NOT NULL,
+    source_format TEXT NOT NULL,
+    uploadtime INTEGER,
+    metadata_json TEXT NOT NULL,
+    PRIMARY KEY (replay_id, content_sha256, parser_version)
+);
+
+CREATE TABLE IF NOT EXISTS campaign_log_claims (
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+    log_sha256 TEXT NOT NULL,
+    replay_id TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    lease_token TEXT,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'selected')),
+    PRIMARY KEY (campaign_id, log_sha256)
+);
+"""
+
 
 def _parse_version(version: str) -> tuple[int, int, int]:
     parts = version.split(".")
@@ -299,6 +327,11 @@ def initialize_catalog(root: Path) -> None:
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 if version == CATALOG_VERSION:
                     return
+                if version == 1 and CATALOG_VERSION == 2:
+                    conn.executescript(_MIGRATE_V1_TO_V2)
+                    conn.execute("PRAGMA user_version=2")
+                    conn.commit()
+                    return
                 if version not in (0, CATALOG_VERSION):
                     raise StorageIncompatible(
                         f"version de schéma inconnue: {version}",
@@ -307,7 +340,10 @@ def initialize_catalog(root: Path) -> None:
         conn = _connect(path)
         try:
             conn.executescript(_SCHEMA_V1)
+            if CATALOG_VERSION >= 2:
+                conn.executescript(_MIGRATE_V1_TO_V2)
             conn.execute(f"PRAGMA user_version={CATALOG_VERSION}")
+            conn.commit()
         finally:
             conn.close()
     finally:

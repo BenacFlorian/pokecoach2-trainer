@@ -43,6 +43,31 @@ uv run --locked pokecoach-trainer collection resume --job-id job-… --new-attem
 
 Sans `upload_after`, `upload_before`, `teams_file` ni `team_filter`, tous les replays valides du format sont éligibles. Exemple filtré : `configs/collection-mc-filtered.yaml` et `configs/teams.example.json` (chemins relatifs au YAML). Les dates et équipes se combinent par ET ; plusieurs compositions dans le fichier d’équipes s’alternent par OU. Un replay inspecté mais rejeté n’est pas archivé.
 
+### Collecte filtrée par profil dataset
+
+`configs/collection-mc-100k-valid.yaml` charge `configs/dataset-mc-collectable.yaml` (`dataset_recipe_file`) et fige le profil dans la campagne. Seuls les replays **admissibles** (OTS, Elo individuel, inactivité, etc.) sont **publiés** dans l’archive. Un candidat peut être téléchargé pour examen puis rejeté : ça consomme des requêtes, pas le quota de retenus.
+
+```bash
+# Après validation locale, pas pendant les tests unitaires.
+uv run --locked pokecoach-trainer collection start --config configs/collection-mc-100k-valid.yaml
+uv run --locked pokecoach-trainer collection status --job-id JOB_ID
+```
+
+Les budgets (`max_requests`, `max_duration_s`) ne sont **pas** augmentés automatiquement. À un taux d’acceptation partiel, la campagne peut s’arrêter avant 100k retenus ; reprendre avec `--new-attempt --budgets`. Un **nouveau profil** exige une **nouvelle campagne**. Les ~104k objets historiques ne sont pas supprimés.
+
+Snapshot de campagne (pas le snapshot global historique) :
+
+`POST /collection/jobs/{job_id}/snapshot` (préfixe `/collection`).
+
+```bash
+uv run --locked pokecoach-trainer dataset create \
+  --snapshot-id SNAPSHOT_ID \
+  --recipe configs/dataset-mc-collectable.yaml \
+  --dataset-id DATASET_ID
+```
+
+La cible dataset se mesure sur ce snapshot. Splits et conversion restent des contrôles ultérieurs : **admissible ≠ convertible**.
+
 ### Archive (export / sauvegarde / reconstruction)
 
 ```bash

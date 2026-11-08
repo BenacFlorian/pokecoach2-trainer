@@ -72,3 +72,11 @@ def test_inactivity_excluded(archive_env):
     meta = _meta("gen9championsvgc2026regmc-f5", log)
     game = decide_game(meta, recipe)
     assert game.reason_code == "inactivity_loss"
+
+
+def test_timer_warning_with_win_is_not_inactivity(archive_env):
+    recipe = DatasetRecipe()
+    log = build_log(termination="timer_warning", winner="Alice")
+    meta = _meta("gen9championsvgc2026regmc-timer", log)
+    game = decide_game(meta, recipe)
+    assert game.accepted

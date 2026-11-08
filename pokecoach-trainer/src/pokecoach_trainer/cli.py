@@ -269,18 +269,9 @@ def _cmd_base_model(args: argparse.Namespace) -> int:
 
 
 def _load_collection_config(path: Path) -> CollectionConfig:
-    path = _resolve_user_path(path)
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    block = dict(data.get("collection", data))
-    teams_file = block.pop("teams_file", None)
-    if teams_file is not None and block.get("team_filter") is not None:
-        raise InvalidConfiguration("teams_file et team_filter sont exclusifs")
-    if teams_file is not None:
-        from pokecoach_trainer.collection_filters import load_team_filter
+    from pokecoach_trainer.collection_config import load_collection_config
 
-        team_path = (path.parent / str(teams_file)).resolve()
-        block["team_filter"] = load_team_filter(team_path).model_dump(mode="json")
-    return CollectionConfig.model_validate(block)
+    return load_collection_config(path)
 
 
 def _load_snapshot_request(path: Path) -> SnapshotRequest:

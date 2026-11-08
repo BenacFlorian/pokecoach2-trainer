@@ -6,6 +6,7 @@ import pytest
 from pokecoach_trainer.archive_catalog import catalog_connection, catalog_versions
 from pokecoach_trainer.archive_service import archive_replay, is_replay_archived
 from pokecoach_trainer.collection_publication import (
+    build_replay_envelope,
     clear_publication_hooks,
     prepare_replay,
     publish_replay,
@@ -33,6 +34,20 @@ def _payload(replay_id: str, *, log: str = "|turn|1|\n") -> dict:
         "log": log,
         "format": replay_id.split("-")[0],
     }
+
+
+def test_build_replay_envelope_matches_prepare_without_files(pub_env):
+    source = ArchiveSource(provenance="t", fetched_at=datetime.now(timezone.utc))
+    replay_id = "gen9championsvgc2026regmc-env"
+    payload = _payload(replay_id)
+    archive = pub_env / "archive"
+    before = list(archive.rglob("*")) if archive.exists() else []
+    ref, envelope = build_replay_envelope(replay_id, payload, source)
+    after = list(archive.rglob("*")) if archive.exists() else []
+    assert before == after
+    prepared = prepare_replay(pub_env, replay_id, payload, source)
+    assert ref.content_sha256 == prepared.ref.content_sha256
+    assert envelope["log_sha256"] == prepared.envelope["log_sha256"]
 
 
 def test_same_id_hash_publishes_once_under_race(pub_env):
@@ -182,3 +197,111 @@ def test_rejected_payload_never_reaches_publication_or_logs(pub_env):
     staging = list((pub_env / "archive" / "staging").glob("*")) if (pub_env / "archive" / "staging").is_dir() else []
     assert intents == 0
     assert staging == []
+
+
+def _filtered_prepared(pub_env, store):
+    from pokecoach_trainer.collection_types import SearchItem
+    from pokecoach_trainer.schemas import CollectionConfig, ReplayFilterConfig
+    from replay_log_fixtures import build_log
+
+    view = store.start_campaign(
+        CollectionConfig(
+            format_ids=["mc"],
+            max_selected_replays=5,
+            dataset_filters=ReplayFilterConfig(),
+        )
+    )
+    replay_id = "gen9championsvgc2026regmc-crash"
+    store.enqueue_replays(
+        view.job.job_id,
+        [SearchItem(replay_id, 1, "gen9championsvgc2026regmc")],
+    )
+    claim = store.claim_download(view.job.job_id, "w1")
+    assert claim.lease
+    payload = {
+        "id": replay_id,
+        "uploadtime": 1,
+        "log": build_log(p1_rating=1300, p2_rating=900),
+        "format": "gen9championsvgc2026regmc",
+    }
+    source = ArchiveSource(provenance="t", fetched_at=datetime.now(timezone.utc))
+    from pokecoach_trainer.collection_filters import evaluate_collection_candidate
+    from pokecoach_trainer.collection_publication import build_replay_envelope
+
+    ref, envelope = build_replay_envelope(replay_id, payload, source)
+    evaluation = evaluate_collection_candidate(view.effective_config, ref, envelope)
+    assert store.record_evaluation(claim.lease, ref, evaluation) == "ready"
+    prepared = prepare_replay(pub_env, replay_id, payload, source)
+    return view, claim.lease, prepared
+
+
+def _assert_recovered_once(store, campaign_id, replay_id):
+    from pokecoach_trainer.archive_catalog import catalog_connection
+
+    recovered = recover_publications(store)
+    assert recovered >= 1
+    assert is_replay_archived(replay_id)
+    campaign = store.get_campaign(campaign_id)
+    assert campaign.counters["selected_in_attempt"] == 1
+    with catalog_connection(store._root) as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) AS n FROM campaign_log_claims WHERE state='pending'"
+        ).fetchone()["n"]
+        intents = conn.execute("SELECT COUNT(*) AS n FROM publication_intents").fetchone()["n"]
+        selected = conn.execute(
+            "SELECT COUNT(*) AS n FROM campaign_replays WHERE decision='selected'"
+        ).fetchone()["n"]
+    assert pending == 0
+    assert intents == 0
+    assert selected == 1
+    again = recover_publications(store)
+    assert store.get_campaign(campaign_id).counters["selected_in_attempt"] == 1
+    _ = again
+
+
+def test_recover_crash_before_rename_finalizes_selection(pub_env):
+    store = CollectionStore(pub_env)
+    view, lease, prepared = _filtered_prepared(pub_env, store)
+
+    def crash() -> None:
+        raise RuntimeError("before rename")
+
+    set_publication_hook("before_rename", crash)
+    try:
+        publish_replay(store, prepared, lease=lease)
+    except RuntimeError:
+        pass
+    clear_publication_hooks()
+    _assert_recovered_once(store, view.job.job_id, prepared.ref.replay_id)
+
+
+def test_recover_crash_after_rename_before_catalog_finalizes(pub_env):
+    store = CollectionStore(pub_env)
+    view, lease, prepared = _filtered_prepared(pub_env, store)
+
+    def crash() -> None:
+        raise RuntimeError("after rename")
+
+    set_publication_hook("after_rename_before_catalog", crash)
+    try:
+        publish_replay(store, prepared, lease=lease)
+    except RuntimeError:
+        pass
+    clear_publication_hooks()
+    _assert_recovered_once(store, view.job.job_id, prepared.ref.replay_id)
+
+
+def test_recover_crash_after_catalog_before_finalize(pub_env):
+    store = CollectionStore(pub_env)
+    view, lease, prepared = _filtered_prepared(pub_env, store)
+
+    def crash() -> None:
+        raise RuntimeError("after catalog")
+
+    set_publication_hook("after_catalog_before_finalize", crash)
+    try:
+        publish_replay(store, prepared, lease=lease)
+    except RuntimeError:
+        pass
+    clear_publication_hooks()
+    _assert_recovered_once(store, view.job.job_id, prepared.ref.replay_id)
